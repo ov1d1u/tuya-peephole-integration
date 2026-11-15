@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from custom_components.tuya_peephole.webrtc_session import (
+    JITTER_HOLE_TIMEOUT,
+    make_hole_skipping_jitter_buffer,
     patch_aiortc_h264_decoder,
     patch_aiortc_h264_depayloader,
     split_annexb,
@@ -223,3 +225,95 @@ class TestAccessUnitSplit:
         units = split_hevc_access_units(FIXTURE.read_bytes())
         merged = b"".join(units[:6])
         assert split_hevc_access_units(merged) == units[:6]
+
+
+# ---------------------------------------------------------------------------
+# Lost packets
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _decode_with_loss(buffer, lost: set[int], step: float) -> tuple[list, int]:
+    """Feed the camera packets minus `lost` (indexes) with `step` seconds
+    between packets. Returns decoded frames and how many PLIs were asked."""
+    decoder = h264.H264Decoder()
+    clock = getattr(buffer, "_test_clock", None)
+    frames, plis = [], 0
+    for index, packet in enumerate(_camera_packets(same_ts_first_gop=False)):
+        if clock is not None:
+            clock.now += step
+        if index in lost:
+            continue
+        _, packet._data = h264.H264PayloadDescriptor.parse(packet.payload)
+        pli, encoded = buffer.add(packet)
+        plis += pli
+        if encoded is None:
+            continue
+        try:
+            frames.extend(decoder.decode(encoded))
+        except h264.av.FFmpegError:
+            continue
+    return frames, plis
+
+
+def _hole_skipping_buffer():
+    clock = _Clock()
+    buffer = make_hole_skipping_jitter_buffer(jitterbuffer, clock)(
+        capacity=512, is_video=True
+    )
+    buffer._test_clock = clock
+    return buffer
+
+
+@pytest.mark.usefixtures("patched")
+def test_stock_jitter_buffer_stalls_on_a_lost_packet() -> None:
+    """The second snapshot in the bug report: one packet of the opening
+    keyframe never arrives, and nothing comes out for 512 packets."""
+    buffer = jitterbuffer.JitterBuffer(capacity=512, is_video=True)
+    frames, _ = _decode_with_loss(buffer, lost={3}, step=0.02)
+    assert frames == []
+
+
+@pytest.mark.usefixtures("patched")
+def test_lost_packet_is_skipped_and_next_keyframe_decodes() -> None:
+    buffer = _hole_skipping_buffer()
+    frames, plis = _decode_with_loss(buffer, lost={3}, step=0.2)
+    # the first GOP is undecodable without its keyframe; the second GOP's
+    # six pictures come through
+    assert len(frames) == 6
+    assert plis >= 1
+
+
+@pytest.mark.usefixtures("patched")
+def test_gap_is_not_skipped_before_the_timeout() -> None:
+    """Fast packets: the whole stream arrives within the timeout, so the
+    buffer keeps waiting for the missing packet like stock aiortc."""
+    buffer = _hole_skipping_buffer()
+    step = JITTER_HOLE_TIMEOUT / 1000
+    frames, plis = _decode_with_loss(buffer, lost={3}, step=step)
+    assert frames == []
+    assert plis == 0
+
+
+@pytest.mark.usefixtures("patched")
+def test_reordered_packet_is_not_treated_as_lost() -> None:
+    buffer = _hole_skipping_buffer()
+    packets = _camera_packets(same_ts_first_gop=False)
+    packets[3], packets[4] = packets[4], packets[3]
+    decoder = h264.H264Decoder()
+    frames = []
+    for packet in packets:
+        buffer._test_clock.now += 0.2
+        _, packet._data = h264.H264PayloadDescriptor.parse(packet.payload)
+        pli, encoded = buffer.add(packet)
+        assert not pli
+        if encoded is not None:
+            frames.extend(decoder.decode(encoded))
+    assert len(frames) == 12
