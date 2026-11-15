@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -224,6 +225,102 @@ def patch_aiortc_h264_decoder(h264_module: Any = None) -> bool:
     return True
 
 
+# A packet the camera never resends stalls aiortc's video jitter buffer: it
+# only releases frames from a gap-free run of packets and gives up on a gap
+# only once 512 packets have piled up behind it. The camera sends ~50
+# packets/s, so that takes ~10 s, which eats most of the snapshot timeout
+# before the keyframe request (PLI) even goes out.
+JITTER_HOLE_TIMEOUT = 1.0  # seconds a gap may stall the buffer
+
+
+def make_hole_skipping_jitter_buffer(
+    jitterbuffer_module: Any = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> Any:
+    """Return a JitterBuffer subclass that skips a gap after a short wait.
+
+    When packets keep arriving behind a missing one for longer than
+    JITTER_HOLE_TIMEOUT, the frame with the gap is dropped (it cannot be
+    decoded anyway), a PLI is requested so the camera sends a fresh
+    keyframe, and frames flow again. Returns None without aiortc.
+    """
+    if jitterbuffer_module is None:
+        try:
+            from aiortc import jitterbuffer as jitterbuffer_module
+        except ImportError:
+            return None
+    base = jitterbuffer_module.JitterBuffer
+    uint16_add = jitterbuffer_module.uint16_add
+
+    class HoleSkippingJitterBuffer(base):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._tuya_hole_since: float | None = None
+            self._tuya_newest: int | None = None
+
+        def _tuya_run_length(self) -> int:
+            """Number of consecutive packets present from the origin."""
+            for count in range(self._capacity):
+                if self._packets[(self._origin + count) % self._capacity] is None:
+                    return count
+            return self._capacity
+
+        def add(self, packet: Any) -> tuple[bool, Any]:
+            seq = packet.sequence_number
+            if self._tuya_newest is None or 0 < uint16_add(
+                seq, -self._tuya_newest
+            ) < 0x8000:
+                self._tuya_newest = seq
+
+            pli_flag, frame = super().add(packet)
+            if frame is not None or self._origin is None:
+                self._tuya_hole_since = None
+                return pli_flag, frame
+
+            run = self._tuya_run_length()
+            newest = uint16_add(self._tuya_newest, -self._origin)
+            if newest >= self._capacity:
+                self._tuya_newest = seq  # buffer was reset under us
+                newest = uint16_add(seq, -self._origin)
+            if newest < run:
+                # No gap behind the newest packet: the current frame is
+                # just still incomplete.
+                self._tuya_hole_since = None
+                return pli_flag, frame
+
+            now = clock()
+            if self._tuya_hole_since is None:
+                self._tuya_hole_since = now
+                return pli_flag, frame
+            if now - self._tuya_hole_since < JITTER_HOLE_TIMEOUT:
+                return pli_flag, frame
+
+            _LOGGER.debug(
+                "RTP packet %d never arrived; skipping the broken frame",
+                uint16_add(self._origin, run),
+            )
+            self._tuya_hole_since = None
+            if self.smart_remove(run + 1):
+                self._origin = None  # everything dropped; reseed on next add
+                return True, None
+            return True, self._remove_frame(seq)
+
+    return HoleSkippingJitterBuffer
+
+
+def install_hole_skipping_jitter_buffer(receiver: Any) -> bool:
+    """Swap a fresh video RTCRtpReceiver's jitter buffer for one that skips
+    lost packets quickly. Must run before any packet is received."""
+    buffer_cls = make_hole_skipping_jitter_buffer()
+    attr = "_RTCRtpReceiver__jitter_buffer"
+    current = getattr(receiver, attr, None)
+    if buffer_cls is None or current is None or not current._is_video:
+        _LOGGER.debug("Cannot install hole-skipping jitter buffer")
+        return False
+    setattr(receiver, attr, buffer_cls(capacity=current.capacity, is_video=True))
+    return True
+
+
 if AIORTC_AVAILABLE:
     patch_aiortc_h264_depayloader()
     patch_aiortc_h264_decoder()
@@ -379,7 +476,10 @@ class ServerWebRTCSession:
             self._setup_media()
 
             # Step 5: Add recvonly video transceiver
-            self._pc.addTransceiver("video", direction="recvonly")
+            transceiver = self._pc.addTransceiver(
+                "video", direction="recvonly"
+            )
+            install_hole_skipping_jitter_buffer(transceiver.receiver)
 
             # Step 6: Register track handler
             @self._pc.on("track")
