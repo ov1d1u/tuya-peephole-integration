@@ -28,6 +28,11 @@ class _ConfigEntryNotReady(Exception):
     """Mock ConfigEntryNotReady for testing."""
 
 
+class _HomeAssistantError(Exception):
+    """Mock HomeAssistantError for testing."""
+
+
+_ha_exceptions.HomeAssistantError = _HomeAssistantError  # type: ignore[attr-defined]
 _ha_exceptions.ConfigEntryAuthFailed = _ConfigEntryAuthFailed  # type: ignore[attr-defined]
 _ha_exceptions.ConfigEntryNotReady = _ConfigEntryNotReady  # type: ignore[attr-defined]
 

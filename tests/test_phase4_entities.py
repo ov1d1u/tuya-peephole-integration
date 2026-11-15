@@ -34,39 +34,31 @@ class TestTuyaSnapshotButton:
         assert button._attr_name == "Snapshot"
 
     @pytest.mark.asyncio
-    async def test_snapshot_button_press_wakes_camera(self, mock_coordinator):
-        """[CTRL-02] Snapshot button wakes camera if sleeping."""
+    async def test_snapshot_button_press_captures_from_stream(self, mock_coordinator):
+        """[CTRL-02] Snapshot button captures a frame via the coordinator."""
         from custom_components.tuya_peephole.button import TuyaSnapshotButton
-        from custom_components.tuya_peephole.models import CameraState
 
-        mock_coordinator.camera_state = CameraState.SLEEPING
-        mock_coordinator.async_wake_camera = AsyncMock(return_value=True)
-        mock_coordinator.api.async_get_snapshot = AsyncMock(
-            return_value="https://example.com/snap.jpg"
+        mock_coordinator.async_capture_snapshot = AsyncMock(
+            return_value=b"\xff\xd8jpeg"
         )
         button = TuyaSnapshotButton(mock_coordinator)
 
         await button.async_press()
 
-        mock_coordinator.async_wake_camera.assert_awaited_once()
+        mock_coordinator.async_capture_snapshot.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_snapshot_button_press_requests_snapshot(self, mock_coordinator):
-        """[CTRL-02] Snapshot button requests snapshot from API."""
-        from custom_components.tuya_peephole.button import TuyaSnapshotButton
-        from custom_components.tuya_peephole.models import CameraState
+    async def test_snapshot_button_press_raises_on_failure(self, mock_coordinator):
+        """A failed capture raises HomeAssistantError so the UI shows it."""
+        from homeassistant.exceptions import HomeAssistantError
 
-        mock_coordinator.camera_state = CameraState.AWAKE
-        mock_coordinator.api.async_get_snapshot = AsyncMock(
-            return_value="https://example.com/snap.jpg"
-        )
+        from custom_components.tuya_peephole.button import TuyaSnapshotButton
+
+        mock_coordinator.async_capture_snapshot = AsyncMock(return_value=None)
         button = TuyaSnapshotButton(mock_coordinator)
 
-        await button.async_press()
-
-        mock_coordinator.api.async_get_snapshot.assert_awaited_once_with(
-            mock_coordinator.device_id
-        )
+        with pytest.raises(HomeAssistantError, match="Snapshot failed"):
+            await button.async_press()
 
     def test_button_setup_registers_both_buttons(
         self, mock_hass_with_loop, mock_coordinator, mock_config_entry

@@ -55,6 +55,7 @@ EVENT_HISTORY_LIMIT = 20  # Number of recent events to fetch
 
 # Snapshot settings
 SNAPSHOT_TIMEOUT = 15  # seconds to wait for snapshot frame
+SNAPSHOT_SKIP_FRAMES = 5  # decoded frames to skip while the stream settles
 
 # Recording settings
 RECORDING_DURATION = 60  # seconds per motion-triggered clip

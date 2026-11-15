@@ -58,6 +58,9 @@ class TuyaMQTTClient:
         self._on_connected_callback: Callable[[], None] | None = None
         self._on_disconnected_callback: Callable[[], None] | None = None
 
+        # Per-topic callbacks (several WebRTC sessions can share one topic)
+        self._topic_callbacks: dict[str, list[Callable[..., None]]] = {}
+
     # --- AsyncioHelper socket callbacks ---
     # These integrate paho-mqtt's socket I/O into the asyncio event loop,
     # replacing the need for loop_start() / background thread.
@@ -288,9 +291,20 @@ class TuyaMQTTClient:
     def unsubscribe(self, topic: str) -> None:
         """Unsubscribe from an MQTT topic.
 
+        Skipped while other per-topic callbacks are still registered, so one
+        WebRTC session (live view, recording, snapshot) ending does not cut
+        off signaling for another session sharing the same topic.
+
         Args:
             topic: Topic string to unsubscribe from.
         """
+        if self._topic_callbacks.get(topic):
+            _LOGGER.debug(
+                "MQTT unsubscribe from %s skipped: %d callback(s) still active",
+                topic,
+                len(self._topic_callbacks[topic]),
+            )
+            return
         self._client.unsubscribe(topic)
         _LOGGER.debug("MQTT unsubscribed from %s", topic)
 
@@ -299,22 +313,47 @@ class TuyaMQTTClient:
     ) -> None:
         """Add a per-topic message callback.
 
-        Messages matching this topic will be routed to the callback
-        instead of the default message handler.
+        Messages matching this topic are routed to every callback added for
+        it instead of the default message handler. paho keeps only one
+        callback per topic, so this wrapper fans out to all of them.
 
         Args:
             topic: Topic filter string.
             callback: Callback function matching paho's on_message signature.
         """
-        self._client.message_callback_add(topic, callback)
+        callbacks = self._topic_callbacks.setdefault(topic, [])
+        if not callbacks:
 
-    def message_callback_remove(self, topic: str) -> None:
+            def _dispatch(client: Any, userdata: Any, msg: Any) -> None:
+                for cb in list(self._topic_callbacks.get(topic, [])):
+                    try:
+                        cb(client, userdata, msg)
+                    except Exception:
+                        _LOGGER.exception(
+                            "Error in MQTT callback for %s", topic
+                        )
+
+            self._client.message_callback_add(topic, _dispatch)
+        callbacks.append(callback)
+
+    def message_callback_remove(
+        self, topic: str, callback: Callable[..., None] | None = None
+    ) -> None:
         """Remove a per-topic message callback.
 
         Args:
             topic: Topic filter to remove callback for.
+            callback: The callback to remove. If None, removes all
+                callbacks for the topic.
         """
-        self._client.message_callback_remove(topic)
+        callbacks = self._topic_callbacks.get(topic, [])
+        if callback is None:
+            callbacks.clear()
+        elif callback in callbacks:
+            callbacks.remove(callback)
+        if not callbacks:
+            self._topic_callbacks.pop(topic, None)
+            self._client.message_callback_remove(topic)
 
     async def async_disconnect(self) -> None:
         """Disconnect from the MQTT broker and clean up resources."""

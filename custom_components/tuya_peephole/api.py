@@ -99,11 +99,19 @@ class TuyaSmartAPI:
                 },
                 timeout=timeout,
             ) as resp:
-                result: dict[str, Any] = await resp.json()
+                if resp.status != 200:
+                    # The portal answers unknown endpoints with an empty
+                    # non-JSON body (e.g. 501 Not Implemented).
+                    raise TuyaApiError(
+                        f"HTTP {resp.status} from {path}"
+                    )
+                result: dict[str, Any] = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise TuyaApiError(f"API request failed: {err}") from err
         except TimeoutError as err:
             raise TuyaApiError(f"API request timed out: {path}") from err
+        except ValueError as err:
+            raise TuyaApiError(f"Invalid JSON from {path}: {err}") from err
 
         if not result.get("success"):
             error_code = result.get("errorCode", "unknown")
@@ -291,25 +299,6 @@ class TuyaSmartAPI:
         self._mqtt_cache = resp["result"]
         self._mqtt_cache_time = time.time()
         return self._mqtt_cache
-
-    async def async_get_snapshot(self, device_id: str) -> str | None:
-        """Request snapshot URL from Tuya API.
-
-        Args:
-            device_id: Tuya device ID.
-
-        Returns:
-            URL string for the snapshot JPEG, or None if not available.
-        """
-        try:
-            resp = await self._post(
-                "/api/device/capture",
-                {"devId": device_id},
-            )
-            return resp.get("result", {}).get("url")
-        except Exception:
-            _LOGGER.debug("Snapshot URL request failed", exc_info=True)
-            return None
 
     async def async_get_message_list(
         self, device_id: str, limit: int = 20

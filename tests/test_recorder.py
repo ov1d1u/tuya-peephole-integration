@@ -117,7 +117,7 @@ class TestRecordingSession:
         mock_pc.close.assert_awaited_once()
         # MQTT callback should have been removed via public method
         coord.mqtt_client.message_callback_remove.assert_called_with(
-            "/av/u/test_msid_789"
+            "/av/u/test_msid_789", session._signaling_cb
         )
 
     @pytest.mark.asyncio

@@ -175,21 +175,29 @@ class TestCameraAvailability:
 
 
 class TestCameraSnapshot:
-    """Tests for async_camera_image placeholder."""
+    """Tests for async_camera_image (serves the stored snapshot)."""
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_returns_none(self) -> None:
-        """async_camera_image returns None (SDP proxy has no server-side media)."""
-        camera = _make_camera()
+    async def test_async_camera_image_returns_none_without_snapshot(self) -> None:
+        """No snapshot captured yet -> None, and nothing is woken or fetched."""
+        coordinator = _make_mock_coordinator()
+        coordinator.last_snapshot = None
+        camera = _make_camera(coordinator)
         result = await camera.async_camera_image()
         assert result is None
+        coordinator.async_wake_camera.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_with_dimensions_returns_none(self) -> None:
-        """async_camera_image returns None even with width/height specified."""
-        camera = _make_camera()
+    async def test_async_camera_image_returns_stored_snapshot(self) -> None:
+        """Returns the coordinator's last snapshot without opening a stream."""
+        coordinator = _make_mock_coordinator()
+        coordinator.last_snapshot = b"\xff\xd8jpeg"
+        coordinator.async_capture_snapshot = AsyncMock()
+        camera = _make_camera(coordinator)
         result = await camera.async_camera_image(width=640, height=480)
-        assert result is None
+        assert result == b"\xff\xd8jpeg"
+        coordinator.async_capture_snapshot.assert_not_awaited()
+        coordinator.async_wake_camera.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Provides wake and snapshot button entities:
 - TuyaWakeButton: triggers the camera wake-up sequence
-- TuyaSnapshotButton: triggers on-demand snapshot capture
+- TuyaSnapshotButton: grabs a frame from the live stream as a snapshot
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import TuyaPeepholeCoordinator
 from .entity import TuyaPeepholeEntity
-from .models import CameraState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,9 +82,8 @@ class TuyaWakeButton(TuyaPeepholeEntity, ButtonEntity):
 class TuyaSnapshotButton(TuyaPeepholeEntity, ButtonEntity):
     """Snapshot button entity.
 
-    Triggers an on-demand snapshot capture from the camera.
-    Wakes camera if sleeping, then requests snapshot from Tuya API.
-    Falls back to latest event thumbnail if direct snapshot fails.
+    Wakes the camera, grabs one frame from its live WebRTC stream, and
+    stores it as the camera entity's image.
     """
 
     _attr_icon = "mdi:camera"
@@ -98,36 +97,16 @@ class TuyaSnapshotButton(TuyaPeepholeEntity, ButtonEntity):
         super().__init__(coordinator, "snapshot", "Snapshot")
 
     async def async_press(self) -> None:
-        """Handle button press -- trigger snapshot.
+        """Handle button press -- capture a fresh snapshot from the stream.
 
-        Wakes camera if sleeping, then requests snapshot from Tuya API.
-        Falls back to latest event thumbnail.
+        Raises:
+            HomeAssistantError: If no frame could be captured, so the
+                failure shows in the UI instead of only in the log.
         """
-        # Wake camera if needed
-        if self.coordinator.camera_state != CameraState.AWAKE:
-            await self.coordinator.async_wake_camera()
-
-        # Request snapshot URL from Tuya API
-        try:
-            snapshot_url = await self.coordinator.api.async_get_snapshot(
-                self.coordinator.device_id
+        image = await self.coordinator.async_capture_snapshot()
+        if image is None:
+            raise HomeAssistantError(
+                "Snapshot failed: no video frame from the camera "
+                "(see the log for details)"
             )
-            if snapshot_url:
-                _LOGGER.info(
-                    "Snapshot URL obtained: %s", snapshot_url[:60]
-                )
-                return
-        except Exception:
-            _LOGGER.debug("Snapshot API failed", exc_info=True)
-
-        # Fallback: fetch latest event thumbnail
-        try:
-            events = await self.coordinator.api.async_get_message_list(
-                self.coordinator.device_id, limit=1
-            )
-            if events and events[0].get("attachPic"):
-                _LOGGER.info("Fallback: using event thumbnail")
-        except Exception:
-            _LOGGER.warning(
-                "Snapshot capture failed entirely", exc_info=True
-            )
+        _LOGGER.info("Snapshot captured (%d bytes)", len(image))

@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.camera.webrtc import (
     WebRTCAnswer,
@@ -35,7 +35,6 @@ from .const import (
     WEBRTC_STREAM_TYPE_HD,
     WEBRTC_SUBSCRIBE_TOPIC_TEMPLATE,
 )
-from .models import CameraState
 from .webrtc_signaling import (
     build_candidate_payload,
     build_disconnect_payload,
@@ -100,6 +99,7 @@ class TuyaPeepholeCamera(Camera):
         self._send_message: WebRTCSendMessage | None = None
         self._answer_event: asyncio.Event = asyncio.Event()
         self._signaling_task: asyncio.Task[None] | None = None
+        self._signaling_cb: Callable[..., None] | None = None
 
         # Cached config (populated on first offer)
         self._webrtc_config: dict[str, Any] | None = None
@@ -120,61 +120,30 @@ class TuyaPeepholeCamera(Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Capture snapshot from camera.
+        """Return the last snapshot grabbed from the live stream.
 
-        Attempts to fetch a snapshot by:
-        1. Wake camera if sleeping
-        2. Request snapshot URL from Tuya API
-        3. Download JPEG from the URL
-
-        Falls back to latest event thumbnail if direct snapshot fails.
+        Home Assistant calls this every few seconds while a camera card is
+        open. Opening a WebRTC stream each time would keep this battery
+        camera awake, so this only returns the stored image. A fresh one is
+        captured by the Snapshot button (coordinator.async_capture_snapshot).
         """
-        # Step 1: Wake camera if sleeping
-        if self.coordinator.camera_state != CameraState.AWAKE:
-            awake = await self.coordinator.async_wake_camera()
-            if not awake:
-                _LOGGER.warning("Cannot snapshot: camera did not wake")
-                return await self._fetch_event_thumbnail()
+        return self.coordinator.last_snapshot
 
-        # Step 2: Try Tuya snapshot API
-        try:
-            snapshot_url = await self.coordinator.api.async_get_snapshot(
-                self.coordinator.device_id
-            )
-            if snapshot_url:
-                return await self._download_image(snapshot_url)
-        except Exception:
-            _LOGGER.debug(
-                "Snapshot API failed, trying event thumbnail",
-                exc_info=True,
-            )
+    async def async_added_to_hass(self) -> None:
+        """Refresh entity state (and the image URL) when a snapshot lands."""
+        await super().async_added_to_hass()
+        last_seen = self.coordinator.last_snapshot_time
 
-        # Step 3: Fallback to latest event thumbnail
-        return await self._fetch_event_thumbnail()
+        @callback
+        def _on_coordinator_update() -> None:
+            nonlocal last_seen
+            if self.coordinator.last_snapshot_time != last_seen:
+                last_seen = self.coordinator.last_snapshot_time
+                self.async_write_ha_state()
 
-    async def _fetch_event_thumbnail(self) -> bytes | None:
-        """Fetch the most recent event thumbnail as fallback snapshot."""
-        try:
-            events = await self.coordinator.api.async_get_message_list(
-                self.coordinator.device_id, limit=1
-            )
-            if events and events[0].get("attachPic"):
-                return await self._download_image(events[0]["attachPic"])
-        except Exception:
-            _LOGGER.debug("Event thumbnail fetch failed", exc_info=True)
-        return None
-
-    async def _download_image(self, url: str) -> bytes | None:
-        """Download image from URL using the API session."""
-        try:
-            async with self.coordinator.api._session.get(
-                url, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-        except Exception:
-            _LOGGER.debug("Image download failed: %s", url, exc_info=True)
-        return None
+        self.async_on_remove(
+            self.coordinator.async_add_listener(_on_coordinator_update)
+        )
 
     async def _async_ensure_config(self) -> None:
         """Fetch and cache WebRTC and MQTT config from Tuya API."""
@@ -282,12 +251,16 @@ class TuyaPeepholeCamera(Camera):
                 device_id=self.coordinator.device_id,
             )
 
-            # Register per-topic callback for WebRTC signaling messages
-            mqtt_client.message_callback_add(
-                subscribe_topic,
+            # Register per-topic callback for WebRTC signaling messages.
+            # Keep a reference so cleanup removes only this callback (the
+            # topic is shared with recording and snapshot sessions).
+            self._signaling_cb = (
                 lambda client, userdata, msg: self._on_signaling_message(
                     msg.payload, signaling_id
-                ),
+                )
+            )
+            mqtt_client.message_callback_add(
+                subscribe_topic, self._signaling_cb
             )
             mqtt_client.subscribe(subscribe_topic, qos=1)
             _LOGGER.debug(
@@ -498,7 +471,9 @@ class TuyaPeepholeCamera(Camera):
         mqtt_client = self.coordinator.mqtt_client
         if mqtt_client is not None:
             try:
-                mqtt_client.message_callback_remove(subscribe_topic)
+                mqtt_client.message_callback_remove(
+                    subscribe_topic, self._signaling_cb
+                )
                 mqtt_client.unsubscribe(subscribe_topic)
             except Exception:
                 _LOGGER.debug(
@@ -514,6 +489,7 @@ class TuyaPeepholeCamera(Camera):
         self._send_message = None
         self._signaling_id = None
         self._signaling_task = None
+        self._signaling_cb = None
         self._answer_event.clear()
 
     def _send_error(self, message: str) -> None:

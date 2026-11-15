@@ -121,6 +121,7 @@ class TestPost:
     ) -> None:
         """USER_PASSWD_WRONG error code raises TuyaAuthError."""
         mock_response = AsyncMock()
+        mock_response.status = 200
         mock_response.json = AsyncMock(return_value=auth_error_response)
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=False)
@@ -143,6 +144,7 @@ class TestPost:
     ) -> None:
         """Non-auth error code raises TuyaApiError."""
         mock_response = AsyncMock()
+        mock_response.status = 200
         mock_response.json = AsyncMock(return_value=api_error_response)
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=False)
@@ -157,6 +159,48 @@ class TestPost:
             password="testpass",
         )
         with pytest.raises(TuyaApiError, match="SYSTEM_ERROR"):
+            await api._post("/api/test", {})
+
+    @pytest.mark.asyncio
+    async def test_post_raises_tuya_api_error_on_http_error_status(self) -> None:
+        """A non-200 reply (e.g. 501 with an empty body) raises TuyaApiError without parsing JSON."""
+        mock_response = AsyncMock()
+        mock_response.status = 501
+        mock_response.json = AsyncMock(side_effect=AssertionError("must not parse"))
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock(spec=aiohttp.ClientSession)
+        mock_session.post = MagicMock(return_value=mock_response)
+
+        api = TuyaSmartAPI(
+            session=mock_session,
+            host="protect-eu.ismartlife.me",
+            email="test@example.com",
+            password="testpass",
+        )
+        with pytest.raises(TuyaApiError, match="HTTP 501 from /api/device/capture"):
+            await api._post("/api/device/capture", {})
+
+    @pytest.mark.asyncio
+    async def test_post_raises_tuya_api_error_on_invalid_json(self) -> None:
+        """A 200 reply whose body is not JSON raises TuyaApiError."""
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(side_effect=ValueError("Expecting value"))
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock(spec=aiohttp.ClientSession)
+        mock_session.post = MagicMock(return_value=mock_response)
+
+        api = TuyaSmartAPI(
+            session=mock_session,
+            host="protect-eu.ismartlife.me",
+            email="test@example.com",
+            password="testpass",
+        )
+        with pytest.raises(TuyaApiError, match="Invalid JSON"):
             await api._post("/api/test", {})
 
 

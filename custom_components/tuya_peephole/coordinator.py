@@ -88,6 +88,11 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._charging_detected = False
         self._battery_100_since: float | None = None  # monotonic time when battery first hit 100
 
+        # Last snapshot (JPEG) grabbed from the WebRTC stream
+        self._snapshot_lock = asyncio.Lock()
+        self.last_snapshot: bytes | None = None
+        self.last_snapshot_time: float | None = None  # wall-clock epoch seconds
+
     async def async_connect_mqtt(self) -> None:
         """Connect to Tuya MQTT broker.
 
@@ -298,6 +303,30 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         async_call_later(self.hass, WAKE_COOLDOWN, self._reset_cooldown)
 
         return result
+
+    async def async_capture_snapshot(self) -> bytes | None:
+        """Grab a fresh JPEG from the camera's live stream and keep it.
+
+        If a capture is already running, waits for it and returns its
+        result instead of opening a second stream.
+
+        Returns:
+            The JPEG bytes, or None if the capture failed.
+        """
+        if self._snapshot_lock.locked():
+            async with self._snapshot_lock:
+                return self.last_snapshot
+
+        async with self._snapshot_lock:
+            from .snapshot import async_capture_snapshot
+
+            image = await async_capture_snapshot(self)
+            if image is None:
+                return None
+            self.last_snapshot = image
+            self.last_snapshot_time = _time.time()
+            self.async_set_updated_data(self._build_state_dict())
+            return image
 
     async def async_fetch_events(self) -> list[dict[str, Any]]:
         """Fetch recent events from Tuya Message Center API.
