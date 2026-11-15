@@ -12,6 +12,9 @@ from enum import Enum
 
 _LOGGER = logging.getLogger(__name__)
 
+# DPS the camera sets true on waking and false on going to sleep
+DPS_AWAKE = "149"
+
 
 class CameraState(Enum):
     """Camera lifecycle state (3-state model).
@@ -72,6 +75,9 @@ class TuyaMQTTMessage:
         Others just send DPS updates (protocol 4) or events (protocol 56)
         when they're active — any such message means the camera is awake.
         """
+        # The camera announcing it is going to sleep is not a wake
+        if self.is_sleep_signal:
+            return False
         # Explicit wake confirmation
         if "wireless_awake" in self._text:
             return True
@@ -81,6 +87,26 @@ class TuyaMQTTMessage:
             if proto in (4, 56):
                 return True
         return False
+
+    @property
+    def is_sleep_signal(self) -> bool:
+        """Check if this message says the camera is going to sleep.
+
+        The camera reports DPS 149 = true when it wakes and false when it
+        goes back to sleep, and the cloud reports it "online": false as it
+        drops to its low-power link. A camera in that state still answers
+        WebRTC signaling but never sends video.
+        """
+        if self._json is None:
+            return False
+        data = self._json.get("data")
+        if not isinstance(data, dict):
+            return False
+        if self._json.get("protocol") == 4:
+            dps = data.get("dps")
+            if isinstance(dps, dict) and dps.get(DPS_AWAKE) is False:
+                return True
+        return data.get("online") is False
 
     @property
     def is_motion(self) -> bool:

@@ -424,3 +424,103 @@ class TestCoordinatorTeardown:
         coordinator.mqtt_client = None
 
         await coordinator.async_teardown()  # Should not raise
+
+
+# Messages copied from a real camera log, in arrival order
+_SLEEP_DPS = b'{"protocol":4,"t":1794742110,"data":{"dps":{"149":false}}}'
+_SLEEP_OFFLINE = (
+    b'{"data":{"devId":"test_device","online":false,'
+    b'"lastOnlineChangeTime":1794742110388,"gwId":"test_device"},'
+    b'"protocol":1,"t":1794742110,"type":"update"}'
+)
+_WAKE_DPS = b'{"protocol":4,"t":1794740288,"data":{"dps":{"149":true}}}'
+_OTHER_DPS = b'{"protocol":4,"t":1794740288,"data":{"dps":{"145":90}}}'
+_TOPIC = "smart/decrypt/in/test_device"
+
+
+class TestSleepSignal:
+    """The camera's go-to-sleep messages must never count as a wake."""
+
+    @pytest.mark.parametrize("payload", [_SLEEP_DPS, _SLEEP_OFFLINE])
+    def test_sleep_messages_are_not_wake(self, payload) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        msg = TuyaMQTTMessage.parse(_TOPIC, payload)
+        assert msg.is_sleep_signal is True
+        assert msg.is_wireless_awake is False
+
+    @pytest.mark.parametrize("payload", [_WAKE_DPS, _OTHER_DPS])
+    def test_wake_messages(self, payload) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        msg = TuyaMQTTMessage.parse(_TOPIC, payload)
+        assert msg.is_sleep_signal is False
+        assert msg.is_wireless_awake is True
+
+    def test_sleep_message_sets_sleeping(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.models import (
+            CameraState,
+            TuyaMQTTMessage,
+        )
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator._camera_state = CameraState.AWAKE
+        coordinator._awake_event.set()
+
+        coordinator._handle_mqtt_message(TuyaMQTTMessage.parse(_TOPIC, _SLEEP_DPS))
+
+        assert coordinator.camera_state == CameraState.SLEEPING
+        assert not coordinator._awake_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_wake_resent_when_camera_falls_asleep(
+        self, mock_hass_with_loop
+    ) -> None:
+        """Wake lands while the camera is shutting down: it reports sleep,
+        the wake is sent again, and only the real wake confirms."""
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator.mqtt_client = _make_mock_mqtt_client()
+
+        async def camera() -> None:
+            await asyncio.sleep(0.01)
+            for payload in (_SLEEP_DPS, _SLEEP_OFFLINE):
+                coordinator._handle_mqtt_message(
+                    TuyaMQTTMessage.parse(_TOPIC, payload)
+                )
+            await asyncio.sleep(0.01)
+            # nothing confirmed by the sleep messages
+            assert coordinator.mqtt_client.publish.call_count == 2
+            coordinator._handle_mqtt_message(TuyaMQTTMessage.parse(_TOPIC, _WAKE_DPS))
+
+        task = asyncio.create_task(camera())
+        with patch(
+            "custom_components.tuya_peephole.coordinator.async_call_later",
+            return_value=MagicMock(),
+        ):
+            result = await coordinator.async_wake_camera(force=True)
+        await task
+
+        assert result is True
+        wake_topics = [
+            c.args[0] for c in coordinator.mqtt_client.publish.call_args_list
+        ]
+        assert wake_topics == ["m/w/test_device_id_abc123"] * 2
+
+    @pytest.mark.asyncio
+    async def test_forced_wake_of_awake_camera_does_not_wait(
+        self, mock_hass_with_loop
+    ) -> None:
+        from custom_components.tuya_peephole.models import CameraState
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator.mqtt_client = _make_mock_mqtt_client()
+        coordinator._camera_state = CameraState.AWAKE
+
+        result = await asyncio.wait_for(
+            coordinator.async_wake_camera(force=True), timeout=1
+        )
+
+        assert result is True
+        coordinator.mqtt_client.publish.assert_called_once()

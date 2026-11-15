@@ -372,3 +372,87 @@ class TestTuyaMQTTClientCallbacks:
         client._on_disconnect(client._client, None, flags, reason_code, None)
 
         disconnected_cb.assert_called_once()
+
+
+class TestTuyaMQTTClientSocketThreadSafety:
+    """paho calls socket callbacks from the executor thread running connect()."""
+
+    @staticmethod
+    def _run(scenario) -> list[dict]:
+        """Run scenario on a fresh debug-mode loop; return loop errors."""
+        import socket
+
+        from custom_components.tuya_peephole.mqtt import TuyaMQTTClient
+
+        loop = asyncio.new_event_loop()
+        loop.set_debug(True)  # enables asyncio's cross-thread checks, like HA --debug
+        errors: list[dict] = []
+        loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+        hass = MagicMock()
+        hass.loop = loop
+        client = TuyaMQTTClient(hass)
+        client._client = MagicMock()
+        client._client.loop_misc.return_value = 0
+        paho = MagicMock()
+        ours, peer = socket.socketpair()
+        try:
+            loop.run_until_complete(scenario(loop, client, paho, ours, peer))
+        finally:
+            ours.close()
+            peer.close()
+            loop.close()
+        return errors
+
+    def test_open_and_write_from_executor_thread(self) -> None:
+        """Reader, writer and misc task are set up on the loop, not the worker."""
+
+        async def scenario(loop, client, paho, ours, peer):
+            await loop.run_in_executor(None, client._on_socket_open, paho, None, ours)
+            await loop.run_in_executor(
+                None, client._on_socket_register_write, paho, None, ours
+            )
+            peer.send(b"x")
+            for _ in range(50):
+                if paho.loop_read.called and paho.loop_write.called:
+                    break
+                await asyncio.sleep(0.01)
+            assert paho.loop_read.called
+            assert paho.loop_write.called
+            assert client._misc_task is not None
+            await loop.run_in_executor(
+                None, client._on_socket_unregister_write, paho, None, ours
+            )
+            await loop.run_in_executor(None, client._on_socket_close, paho, None, ours)
+            await asyncio.sleep(0)
+            assert client._misc_task is None
+
+        assert self._run(scenario) == []
+
+    def test_close_from_executor_survives_paho_closing_socket(self) -> None:
+        """paho closes the socket right after on_socket_close; cleanup must still work."""
+
+        async def scenario(loop, client, paho, ours, peer):
+            await loop.run_in_executor(None, client._on_socket_open, paho, None, ours)
+            await asyncio.sleep(0)
+
+            def paho_sock_close() -> None:
+                client._on_socket_unregister_write(paho, None, ours)
+                client._on_socket_close(paho, None, ours)
+                ours.close()
+
+            await loop.run_in_executor(None, paho_sock_close)
+            await asyncio.sleep(0)
+            assert client._misc_task is None
+
+        assert self._run(scenario) == []
+
+    def test_callbacks_on_loop_thread_run_immediately(self) -> None:
+        """From the loop thread (loop_read/disconnect) no deferral happens."""
+
+        async def scenario(loop, client, paho, ours, peer):
+            client._on_socket_open(paho, None, ours)
+            assert client._misc_task is not None
+            client._on_socket_close(paho, None, ours)
+            assert client._misc_task is None
+
+        assert self._run(scenario) == []

@@ -64,13 +64,35 @@ class TuyaMQTTClient:
     # --- AsyncioHelper socket callbacks ---
     # These integrate paho-mqtt's socket I/O into the asyncio event loop,
     # replacing the need for loop_start() / background thread.
+    #
+    # paho invokes them from whichever thread is driving it: the event loop
+    # (loop_read/loop_write/disconnect) or the executor thread running the
+    # blocking connect(). Event loop methods are not thread-safe, so calls
+    # from other threads are marshalled onto the loop. The file descriptor is
+    # captured in the calling thread because paho closes the socket right
+    # after on_socket_close returns.
+
+    def _call_in_loop(self, func: Callable[..., None], *args: Any) -> None:
+        """Run func on the event loop thread (immediately if already there)."""
+        try:
+            in_loop = asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            in_loop = False
+        if in_loop:
+            func(*args)
+        else:
+            self._loop.call_soon_threadsafe(func, *args)
 
     def _on_socket_open(
         self, client: mqtt.Client, userdata: Any, sock: Any
     ) -> None:
         """Register socket reader when paho opens its socket."""
         _LOGGER.debug("MQTT socket opened, registering reader")
-        self._loop.add_reader(sock, client.loop_read)
+        self._call_in_loop(self._start_reading, client, sock.fileno())
+
+    def _start_reading(self, client: mqtt.Client, fd: int) -> None:
+        """Watch the socket for reads and start the misc loop (loop thread)."""
+        self._loop.add_reader(fd, client.loop_read)
         self._misc_task = self._loop.create_task(self._misc_loop())
 
     def _on_socket_close(
@@ -78,7 +100,11 @@ class TuyaMQTTClient:
     ) -> None:
         """Remove socket reader when paho closes its socket."""
         _LOGGER.debug("MQTT socket closed, removing reader")
-        self._loop.remove_reader(sock)
+        self._call_in_loop(self._stop_reading, sock.fileno())
+
+    def _stop_reading(self, fd: int) -> None:
+        """Stop watching the socket and the misc loop (loop thread)."""
+        self._loop.remove_reader(fd)
         if self._misc_task is not None:
             self._misc_task.cancel()
             self._misc_task = None
@@ -87,13 +113,15 @@ class TuyaMQTTClient:
         self, client: mqtt.Client, userdata: Any, sock: Any
     ) -> None:
         """Register socket writer when paho has data to send."""
-        self._loop.add_writer(sock, client.loop_write)
+        self._call_in_loop(
+            self._loop.add_writer, sock.fileno(), client.loop_write
+        )
 
     def _on_socket_unregister_write(
         self, client: mqtt.Client, userdata: Any, sock: Any
     ) -> None:
         """Remove socket writer when paho finishes sending."""
-        self._loop.remove_writer(sock)
+        self._call_in_loop(self._loop.remove_writer, sock.fileno())
 
     async def _misc_loop(self) -> None:
         """Run paho's misc loop for keepalive and ping handling.

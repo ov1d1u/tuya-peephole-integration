@@ -360,3 +360,128 @@ class TestMQTTSharedTopicCallbacks:
         dispatch(None, None, MagicMock())
 
         good.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ICE server normalization for aiortc
+# ---------------------------------------------------------------------------
+
+
+class TestIceServerNormalization:
+    """Tuya's p2pConfig.ices adapted to what aiortc accepts."""
+
+    @pytest.mark.parametrize(
+        ("uri", "expected"),
+        [
+            ("stun:203.0.113.5:3478", "stun:203.0.113.5:3478"),
+            ("stun:stun.example.com", "stun:stun.example.com"),
+            # aiortc ignores TURN without a transport -> default it
+            ("turn:203.0.113.5:3478", "turn:203.0.113.5:3478?transport=udp"),
+            ("turns:relay.example.com:443", "turns:relay.example.com:443?transport=tcp"),
+            ("turn:203.0.113.5:3478?transport=tcp", "turn:203.0.113.5:3478?transport=tcp"),
+            # aiortc raises "malformed uri" on IPv6 -> drop it
+            ("stun:[2a05:d014:afa:af10:9a8a:756e:9087:735e]:3478", None),
+            ("turn:[2001:db8::1]:3478", None),
+            ("http://example.com", None),
+        ],
+    )
+    def test_normalize_ice_uri(self, uri, expected) -> None:
+        from custom_components.tuya_peephole.webrtc_session import normalize_ice_uri
+
+        assert normalize_ice_uri(uri) == expected
+
+    def test_build_servers_from_tuya_config(self) -> None:
+        """The shape the camera returns: IPv4 STUN, IPv6 STUN, TURN with credentials."""
+        from types import SimpleNamespace
+
+        from custom_components.tuya_peephole import webrtc_session
+
+        ices = [
+            {"urls": "stun:203.0.113.5:3478"},
+            {"urls": "stun:[2a05:d014:afa:af10:9a8a:756e:9087:735e]:3478"},
+            {
+                "urls": "turn:203.0.113.5:3478",
+                "username": "user",
+                "credential": "pass",
+                "ttl": 600,
+            },
+        ]
+        with patch.object(
+            webrtc_session, "RTCIceServer", side_effect=lambda **kw: SimpleNamespace(**kw)
+        ):
+            servers = webrtc_session.build_aiortc_ice_servers(ices)
+
+        assert [s.urls for s in servers] == [
+            "stun:203.0.113.5:3478",
+            "turn:203.0.113.5:3478?transport=udp",
+        ]
+        assert servers[1].username == "user"
+        assert servers[1].credential == "pass"
+
+    def test_build_servers_keeps_list_urls(self) -> None:
+        """A server with a urls list keeps its usable entries as a list."""
+        from types import SimpleNamespace
+
+        from custom_components.tuya_peephole import webrtc_session
+
+        ices = [{"urls": ["turn:203.0.113.5:3478", "turn:[2001:db8::1]:3478", "turns:r.example.com:443"]}]
+        with patch.object(
+            webrtc_session, "RTCIceServer", side_effect=lambda **kw: SimpleNamespace(**kw)
+        ):
+            servers = webrtc_session.build_aiortc_ice_servers(ices)
+
+        assert servers[0].urls == [
+            "turn:203.0.113.5:3478?transport=udp",
+            "turns:r.example.com:443?transport=tcp",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Signaling identity
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSignalingMsid:
+    """The session must signal with the msid the MQTT connection logged in with."""
+
+    @pytest.mark.asyncio
+    async def test_uses_connection_msid_not_fresh_one(
+        self, mock_recording_coordinator
+    ) -> None:
+        """Every /api/jarvis/mqtt call mints a new msid; the broker only
+        delivers /av/u/{msid} to client web_{msid}, so a fresh msid would
+        never receive the camera's answer."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from custom_components.tuya_peephole import webrtc_session
+        from custom_components.tuya_peephole.snapshot import SnapshotSession
+
+        coord = mock_recording_coordinator
+        coord.api.async_get_mqtt_config = AsyncMock(
+            return_value={"msid": "freshly_minted_msid", "password": "x"}
+        )
+        coord.mqtt_client = MagicMock(is_connected=True)
+
+        pc = MagicMock()
+        pc.createOffer = AsyncMock(return_value=MagicMock(sdp="v=0\r\n"))
+        pc.setLocalDescription = AsyncMock()
+        pc.close = AsyncMock()
+
+        session = SnapshotSession(coord)
+        session._setup_media = MagicMock()
+        with (
+            patch.object(webrtc_session, "AIORTC_AVAILABLE", True),
+            patch.object(webrtc_session, "RTCPeerConnection", return_value=pc, create=True),
+            patch.object(webrtc_session, "RTCConfiguration", create=True),
+            patch.object(webrtc_session, "WEBRTC_SESSION_TIMEOUT", 0.01),
+        ):
+            started = await session.async_start()
+
+        assert started is False  # no answer in the test
+        coord.mqtt_client.subscribe.assert_any_call("/av/u/test_msid_789", qos=1)
+        offer = coord.mqtt_client.publish.call_args_list[0].args[1]
+        if isinstance(offer, bytes):
+            offer = offer.decode()
+        assert "test_msid_789" in offer
+        assert "freshly_minted_msid" not in offer
+        coord.api.async_get_mqtt_config.assert_not_called()

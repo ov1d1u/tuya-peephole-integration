@@ -303,3 +303,70 @@ class TestAsyncUnloadEntry:
         # Coordinator should NOT be torn down if platforms failed to unload
         mock_coord.async_teardown.assert_not_awaited()
         mock_rm.async_teardown.assert_not_awaited()
+
+
+class TestChargingListener:
+    """Continuous recording follows charging changes via a sync listener."""
+
+    @pytest.mark.asyncio
+    async def test_listener_is_sync_and_acts_on_transitions_only(
+        self, mock_hass: MagicMock, mock_config_entry: object
+    ) -> None:
+        import inspect
+
+        setup_entry = _get_setup_entry()
+        mock_api = MagicMock()
+        mock_api.async_login = AsyncMock(return_value={"sid": "test_sid"})
+        mock_coord = _make_mock_coordinator()
+        mock_rm = _make_mock_recording_manager()
+
+        with (
+            patch(
+                "custom_components.tuya_peephole.async_create_clientsession",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "custom_components.tuya_peephole.TuyaSmartAPI",
+                return_value=mock_api,
+            ),
+            patch(
+                "custom_components.tuya_peephole.TuyaPeepholeCoordinator",
+                return_value=mock_coord,
+            ),
+            patch(
+                "custom_components.tuya_peephole.async_track_time_interval",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "custom_components.tuya_peephole.RecordingManager",
+                return_value=mock_rm,
+            ),
+        ):
+            await setup_entry(mock_hass, mock_config_entry)
+
+        listener = mock_coord.async_add_listener.call_args_list[-1].args[0]
+        # HA calls coordinator listeners without awaiting them
+        assert not inspect.iscoroutinefunction(listener)
+
+        mock_hass.async_create_task = MagicMock(
+            side_effect=lambda coro: coro.close()
+        )
+
+        start = mock_rm.async_start_continuous
+        stop = mock_rm.async_stop_continuous
+
+        # Not charging and no change: never touch an active recording
+        for _ in range(3):
+            listener()
+        assert (start.call_count, stop.call_count) == (0, 0)
+
+        mock_coord.is_charging = True
+        listener()
+        listener()
+        assert (start.call_count, stop.call_count) == (1, 0)
+
+        mock_coord.is_charging = False
+        listener()
+        listener()
+        assert (start.call_count, stop.call_count) == (1, 1)
+        assert mock_hass.async_create_task.call_count == 2

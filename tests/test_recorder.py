@@ -56,7 +56,11 @@ class TestRecordingSession:
         coord.mqtt_client.publish.assert_called()
         # Verify WebRTC config was fetched
         coord.api.async_get_webrtc_config.assert_awaited()
-        coord.api.async_get_mqtt_config.assert_awaited()
+        # Signals with the connection's msid, never a freshly minted one
+        coord.api.async_get_mqtt_config.assert_not_called()
+        coord.mqtt_client.subscribe.assert_any_call(
+            "/av/u/test_msid_789", qos=1
+        )
 
     @pytest.mark.asyncio
     async def test_recording_session_start_failure_no_mqtt(

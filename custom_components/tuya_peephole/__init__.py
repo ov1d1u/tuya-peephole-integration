@@ -11,7 +11,7 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.event import async_track_time_interval
@@ -143,18 +143,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
-    # Monitor charging state for continuous recording
-    async def _on_coordinator_update() -> None:
-        """Start/stop continuous recording based on charging state."""
+    # Monitor charging state for continuous recording. Coordinator listeners
+    # must be plain callbacks (HA never awaits them), and stopping continuous
+    # mode also stops the active recording, so act only when charging flips.
+    was_charging = False
+
+    @callback
+    def _on_coordinator_update() -> None:
+        """Start/stop continuous recording when the charging state changes."""
+        nonlocal was_charging
+        charging = bool(coordinator.is_charging)
+        if charging == was_charging:
+            return
         rec_mgr: RecordingManager | None = hass.data.get(DOMAIN, {}).get(
             f"{entry.entry_id}_recorder"
         )
         if rec_mgr is None:
             return
-        if coordinator.is_charging:
-            await rec_mgr.async_start_continuous()
+        was_charging = charging
+        if charging:
+            hass.async_create_task(rec_mgr.async_start_continuous())
         else:
-            await rec_mgr.async_stop_continuous()
+            hass.async_create_task(rec_mgr.async_stop_continuous())
 
     entry.async_on_unload(
         coordinator.async_add_listener(_on_coordinator_update)

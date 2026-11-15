@@ -520,6 +520,11 @@ class _MockMediaType:
     VIDEO = "video/mp4"
 
 
+class _MockBrowseError(Exception):
+    """Mock BrowseError (lives in media_player in real HA)."""
+
+
+_mock_ha_media_player.BrowseError = _MockBrowseError  # type: ignore[attr-defined]
 _mock_ha_media_player.MediaClass = _MockMediaClass  # type: ignore[attr-defined]
 _mock_ha_media_player.MediaType = _MockMediaType  # type: ignore[attr-defined]
 sys.modules["homeassistant.components.media_player"] = _mock_ha_media_player
@@ -566,14 +571,10 @@ class _MockBrowseMediaSource:
         self.thumbnail = thumbnail
 
 
-class _MockBrowseError(Exception):
-    """Mock BrowseError."""
-
 _mock_ha_media_source.MediaSource = _MockMediaSource  # type: ignore[attr-defined]
 _mock_ha_media_source.MediaSourceItem = _MockMediaSourceItem  # type: ignore[attr-defined]
 _mock_ha_media_source.PlayMedia = _MockPlayMedia  # type: ignore[attr-defined]
 _mock_ha_media_source.BrowseMediaSource = _MockBrowseMediaSource  # type: ignore[attr-defined]
-_mock_ha_media_source.BrowseError = _MockBrowseError  # type: ignore[attr-defined]
 sys.modules["homeassistant.components.media_source"] = _mock_ha_media_source
 
 # Register all mock modules
@@ -930,7 +931,12 @@ def mock_hass_with_loop():
     """Create a mock hass with event loop for MQTT async testing."""
     hass = MagicMock()
     hass.data = {}
-    hass.loop = asyncio.get_event_loop()
+    try:
+        hass.loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # Python 3.14+: get_event_loop() no longer creates a loop implicitly
+        hass.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(hass.loop)
     hass.async_add_executor_job = AsyncMock(
         side_effect=lambda fn, *args: fn(*args)
     )
@@ -1060,6 +1066,8 @@ def mock_recording_coordinator(mock_coordinator):
     coord._battery_100_since = None
     coord.is_charging = False
     coord.camera_state = CameraState.AWAKE
+    # msid the live MQTT connection logged in with (web_{msid})
+    coord.msid = "test_msid_789"
     coord.register_motion_callback = MagicMock(
         side_effect=lambda cb: (
             coord._on_motion_callbacks.append(cb)

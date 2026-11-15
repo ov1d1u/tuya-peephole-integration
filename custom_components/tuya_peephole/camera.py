@@ -100,10 +100,12 @@ class TuyaPeepholeCamera(Camera):
         self._answer_event: asyncio.Event = asyncio.Event()
         self._signaling_task: asyncio.Task[None] | None = None
         self._signaling_cb: Callable[..., None] | None = None
+        # Browser ICE candidates that arrive before the offer reaches the
+        # camera (the wake wait can take up to 20s); sent once it has.
+        self._pending_candidates: list[str] = []
 
         # Cached config (populated on first offer)
         self._webrtc_config: dict[str, Any] | None = None
-        self._mqtt_config: dict[str, Any] | None = None
         self._uid: str | None = None
         self._moto_id: str | None = None
         self._auth: str | None = None
@@ -159,13 +161,11 @@ class TuyaPeepholeCamera(Camera):
                 self._webrtc_config.get("p2pConfig", {}).get("ices", [])
             )
 
-        if self._mqtt_config is None:
-            self._mqtt_config = (
-                await self.coordinator.api.async_get_mqtt_config(
-                    self.coordinator.device_id
-                )
-            )
-            self._uid = self._mqtt_config["msid"]
+        # The camera answers on /av/u/{msid}, and the Tuya broker only
+        # delivers that topic to the client logged in as web_{msid}. Every
+        # /api/jarvis/mqtt call mints a new msid, so use the one the live
+        # MQTT connection was opened with, never a freshly fetched one.
+        self._uid = self.coordinator.msid
 
     async def async_handle_async_webrtc_offer(
         self,
@@ -183,15 +183,17 @@ class TuyaPeepholeCamera(Camera):
         5. Wait for answer from camera, forward to browser via send_message
         6. Forward camera ICE candidates to browser via send_message
         """
-        # Reject if another session is active (single session at a time)
+        # The camera serves one stream at a time. The newest viewer wins: a
+        # dashboard card that is already streaming, or a session the
+        # frontend never closed, must not lock out the dialog the user just
+        # opened.
         if self._session_id is not None:
-            send_message(
-                WebRTCError(
-                    "webrtc_offer_failed",
-                    "Another WebRTC session is active",
-                )
+            _LOGGER.debug(
+                "Replacing WebRTC session %s with %s",
+                self._session_id,
+                session_id,
             )
-            return
+            self._end_session()
 
         self._session_id = session_id
         self._send_message = send_message
@@ -214,7 +216,6 @@ class TuyaPeepholeCamera(Camera):
 
             # Step 2: Fetch FRESH config (invalidate cache — auth tokens expire)
             self._webrtc_config = None
-            self._mqtt_config = None
             self.coordinator.api.invalidate_cache()
             await self._async_ensure_config()
             _LOGGER.debug(
@@ -293,6 +294,11 @@ class TuyaPeepholeCamera(Camera):
                 len(cleaned_sdp),
             )
 
+            # Browser candidates that arrived while waking the camera
+            pending, self._pending_candidates = self._pending_candidates, []
+            for candidate in pending:
+                self._publish_candidate(candidate)
+
             # Step 7: Wait for SDP answer from camera
             try:
                 await asyncio.wait_for(
@@ -305,7 +311,6 @@ class TuyaPeepholeCamera(Camera):
                     WEBRTC_SESSION_TIMEOUT,
                 )
                 self._send_error("Camera did not respond with SDP answer")
-                self._cleanup_signaling(subscribe_topic)
                 return
 
             # Answer was received and forwarded in _on_signaling_message
@@ -315,16 +320,6 @@ class TuyaPeepholeCamera(Camera):
         except Exception:
             _LOGGER.exception("WebRTC signaling failed")
             self._send_error("WebRTC signaling error")
-            # Attempt cleanup
-            try:
-                subscribe_topic = WEBRTC_SUBSCRIBE_TOPIC_TEMPLATE.format(
-                    msid=self._uid or ""
-                )
-                self._cleanup_signaling(subscribe_topic)
-            except Exception:
-                _LOGGER.exception(
-                    "Cleanup after signaling error also failed"
-                )
 
     def _on_signaling_message(
         self, payload: bytes, signaling_id: str
@@ -363,11 +358,7 @@ class TuyaPeepholeCamera(Camera):
 
         elif msg_type == "disconnect":
             _LOGGER.debug("Camera sent disconnect signal")
-            if self._uid:
-                subscribe_topic = WEBRTC_SUBSCRIBE_TOPIC_TEMPLATE.format(
-                    msid=self._uid
-                )
-                self._cleanup_signaling(subscribe_topic)
+            self._reset_session()
 
     async def async_on_webrtc_candidate(
         self, session_id: str, candidate: RTCIceCandidateInit
@@ -384,6 +375,15 @@ class TuyaPeepholeCamera(Camera):
             )
             return
 
+        formatted = format_candidate_for_camera(candidate.candidate)
+        if not self._signaling_id:
+            # Offer not sent yet (camera still waking): send it afterwards
+            self._pending_candidates.append(formatted)
+            return
+        self._publish_candidate(formatted)
+
+    def _publish_candidate(self, formatted: str) -> None:
+        """Send one browser ICE candidate (camera format) over MQTT."""
         if not self._uid or not self._moto_id or not self._signaling_id:
             _LOGGER.warning(
                 "Cannot forward ICE candidate: config not loaded"
@@ -397,10 +397,7 @@ class TuyaPeepholeCamera(Camera):
             )
             return
 
-        # Format candidate for camera (prepend "a=" prefix)
-        formatted = format_candidate_for_camera(candidate.candidate)
         candidate_payload = build_candidate_payload(formatted)
-
         publish_topic = WEBRTC_PUBLISH_TOPIC_TEMPLATE.format(
             moto_id=self._moto_id,
             device_id=self.coordinator.device_id,
@@ -430,8 +427,10 @@ class TuyaPeepholeCamera(Camera):
             return
 
         _LOGGER.debug("Closing WebRTC session: %s", session_id)
+        self._end_session()
 
-        # Send disconnect message to camera via MQTT (sync-safe)
+    def _end_session(self) -> None:
+        """Tell the camera to hang up (if it was called) and reset state."""
         mqtt_client = self.coordinator.mqtt_client
         if (
             mqtt_client is not None
@@ -440,36 +439,33 @@ class TuyaPeepholeCamera(Camera):
             and self._moto_id
             and self._signaling_id
         ):
-            disconnect_payload = build_disconnect_payload()
-            publish_topic = WEBRTC_PUBLISH_TOPIC_TEMPLATE.format(
-                moto_id=self._moto_id,
-                device_id=self.coordinator.device_id,
-            )
             message = build_protocol_302_message(
                 msg_type="disconnect",
                 uid=self._uid,
                 device_id=self.coordinator.device_id,
                 session_id=self._signaling_id,
                 moto_id=self._moto_id,
-                msg_payload=disconnect_payload,
+                msg_payload=build_disconnect_payload(),
             )
+            publish_topic = WEBRTC_PUBLISH_TOPIC_TEMPLATE.format(
+                moto_id=self._moto_id,
+                device_id=self.coordinator.device_id,
+            )
+            # paho publish() is non-blocking and safe from a callback
             mqtt_client.publish(publish_topic, message, qos=0)
+        self._reset_session()
 
-        # Unsubscribe from signaling topic
-        if self._uid:
+    def _reset_session(self) -> None:
+        """Drop this session's MQTT callback, stop its task, clear state.
+
+        Always leaves the camera free for the next session, even when the
+        session ended before its config or subscription existed.
+        """
+        mqtt_client = self.coordinator.mqtt_client
+        if mqtt_client is not None and self._signaling_cb is not None and self._uid:
             subscribe_topic = WEBRTC_SUBSCRIBE_TOPIC_TEMPLATE.format(
                 msid=self._uid
             )
-            self._cleanup_signaling(subscribe_topic)
-
-    def _cleanup_signaling(self, subscribe_topic: str) -> None:
-        """Remove MQTT subscription and reset session state.
-
-        Args:
-            subscribe_topic: The MQTT topic to unsubscribe from.
-        """
-        mqtt_client = self.coordinator.mqtt_client
-        if mqtt_client is not None:
             try:
                 mqtt_client.message_callback_remove(
                     subscribe_topic, self._signaling_cb
@@ -480,20 +476,25 @@ class TuyaPeepholeCamera(Camera):
                     "Error during signaling cleanup", exc_info=True
                 )
 
-        # Cancel signaling task if still running
-        if self._signaling_task is not None and not self._signaling_task.done():
-            self._signaling_task.cancel()
+        # Stop the signaling task, unless that is what is calling us
+        task = self._signaling_task
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
+            task.cancel()
 
-        # Reset session state
         self._session_id = None
         self._send_message = None
         self._signaling_id = None
         self._signaling_task = None
         self._signaling_cb = None
+        self._pending_candidates = []
         self._answer_event.clear()
 
     def _send_error(self, message: str) -> None:
-        """Send WebRTC error to frontend via send_message callback.
+        """Send WebRTC error to frontend and end the session.
 
         Args:
             message: Error message description.
@@ -502,11 +503,8 @@ class TuyaPeepholeCamera(Camera):
             self._send_message(
                 WebRTCError("webrtc_offer_failed", message)
             )
-        self._session_id = None
-        self._send_message = None
-        self._signaling_id = None
+        self._reset_session()
 
-    @callback
     def async_get_webrtc_client_configuration(
         self,
     ) -> WebRTCClientConfiguration:

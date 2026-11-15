@@ -79,6 +79,7 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._motion_clear_unsub: CALLBACK_TYPE | None = None
         self._wake_cooldown = False
         self._awake_event = asyncio.Event()
+        self._sleep_event = asyncio.Event()
         self._msid: str | None = None
 
         # Motion callback registration for recording manager
@@ -192,10 +193,17 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             message.raw[:100].decode("utf-8", errors="replace") if message.raw else "",
         )
 
-        if message.is_wireless_awake:
+        if message.is_sleep_signal:
+            if self._camera_state != CameraState.SLEEPING:
+                _LOGGER.info("Camera reports going to sleep")
+            self._camera_state = CameraState.SLEEPING
+            self._awake_event.clear()
+            self._sleep_event.set()
+        elif message.is_wireless_awake:
+            if self._camera_state != CameraState.AWAKE:
+                _LOGGER.info("Camera wake confirmed via MQTT")
             self._camera_state = CameraState.AWAKE
             self._awake_event.set()
-            _LOGGER.info("Camera wake confirmed via MQTT")
 
         if message.is_motion:
             self._motion_detected = True
@@ -267,42 +275,67 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Cannot wake camera: MQTT not connected")
             return False
 
+        if self._camera_state == CameraState.AWAKE:
+            # Forced wake of a camera known to be awake (no sleep signal
+            # since it woke): it sends nothing back, so don't wait for it.
+            self._publish_wake()
+            return True
+
         # Transition to WAKING state
         self._camera_state = CameraState.WAKING
         self._wake_cooldown = True
         self.async_set_updated_data(self._build_state_dict())
 
-        # Compute CRC32 wake payload (big-endian 4 bytes)
-        crc = zlib.crc32(self.local_key.encode()) & 0xFFFFFFFF
-        wake_payload = struct.pack(">I", crc)
-        wake_topic = f"m/w/{self.device_id}"
-
-        # Clear event and publish wake command
         self._awake_event.clear()
-        self.mqtt_client.publish(wake_topic, wake_payload, qos=1)
-        _LOGGER.debug(
-            "Wake packet sent: CRC32=%#010x to %s", crc, wake_topic
-        )
+        self._sleep_event.clear()
+        self._publish_wake()
 
-        # Wait for wireless_awake confirmation
-        try:
-            await asyncio.wait_for(
-                self._awake_event.wait(), timeout=WAKE_TIMEOUT
-            )
-            _LOGGER.debug("Camera confirmed awake")
-            result = True
-        except TimeoutError:
+        # Wait for the camera to report awake. If it reports going to sleep
+        # instead (the wake landed while it was shutting down), wake it again.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + WAKE_TIMEOUT
+        result = False
+        while (remaining := deadline - loop.time()) > 0:
+            awake_wait = asyncio.ensure_future(self._awake_event.wait())
+            sleep_wait = asyncio.ensure_future(self._sleep_event.wait())
+            try:
+                await asyncio.wait(
+                    {awake_wait, sleep_wait},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                awake_wait.cancel()
+                sleep_wait.cancel()
+            if self._awake_event.is_set():
+                _LOGGER.debug("Camera confirmed awake")
+                result = True
+                break
+            if self._sleep_event.is_set():
+                _LOGGER.debug("Camera went to sleep while waking; resending wake")
+                self._sleep_event.clear()
+                self._publish_wake()
+
+        if not result:
             _LOGGER.warning(
                 "Camera wake timed out after %ds", WAKE_TIMEOUT
             )
             self._camera_state = CameraState.SLEEPING
             self.async_set_updated_data(self._build_state_dict())
-            result = False
 
         # Schedule cooldown reset
         async_call_later(self.hass, WAKE_COOLDOWN, self._reset_cooldown)
 
         return result
+
+    def _publish_wake(self) -> None:
+        """Publish the CRC32 wake packet (big-endian 4 bytes) to m/w/{id}."""
+        crc = zlib.crc32(self.local_key.encode()) & 0xFFFFFFFF
+        wake_topic = f"m/w/{self.device_id}"
+        self.mqtt_client.publish(wake_topic, struct.pack(">I", crc), qos=1)
+        _LOGGER.debug(
+            "Wake packet sent: CRC32=%#010x to %s", crc, wake_topic
+        )
 
     async def async_capture_snapshot(self) -> bytes | None:
         """Grab a fresh JPEG from the camera's live stream and keep it.
