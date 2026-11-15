@@ -165,6 +165,64 @@ class TestTuyaMotionSensor:
         assert sensor.available is False
 
 
+class TestTuyaAwakeSensor:
+    """Test TuyaAwakeSensor entity."""
+
+    def test_awake_sensor_unique_id_and_name(self, mock_coordinator) -> None:
+        """Awake sensor unique_id is {device_id}_camera_awake."""
+        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
+
+        sensor = TuyaAwakeSensor(mock_coordinator)
+
+        assert sensor._attr_unique_id == "test_device_id_abc123_camera_awake"
+        assert sensor._attr_name == "Camera Awake"
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            ("awake", True),
+            ("sleeping", False),
+            ("waking", False),
+        ],
+    )
+    def test_awake_sensor_is_on_from_string_state(
+        self, mock_coordinator, state, expected
+    ) -> None:
+        """is_on is True only when camera_state is awake."""
+        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
+
+        mock_coordinator.data = {"camera_state": state}
+        sensor = TuyaAwakeSensor(mock_coordinator)
+
+        assert sensor.is_on is expected
+        assert sensor.extra_state_attributes == {"camera_state": state}
+
+    def test_awake_sensor_accepts_enum_state(self, mock_coordinator) -> None:
+        """is_on handles the CameraState enum the coordinator actually pushes."""
+        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
+        from custom_components.tuya_peephole.models import CameraState
+
+        sensor = TuyaAwakeSensor(mock_coordinator)
+
+        mock_coordinator.data = {"camera_state": CameraState.AWAKE}
+        assert sensor.is_on is True
+        assert sensor.icon == "mdi:cctv"
+
+        mock_coordinator.data = {"camera_state": CameraState.SLEEPING}
+        assert sensor.is_on is False
+        assert sensor.icon == "mdi:sleep"
+        assert sensor.extra_state_attributes == {"camera_state": "sleeping"}
+
+    def test_awake_sensor_is_none_when_no_data(self, mock_coordinator) -> None:
+        """is_on returns None when coordinator has no data."""
+        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
+
+        mock_coordinator.data = None
+        sensor = TuyaAwakeSensor(mock_coordinator)
+
+        assert sensor.is_on is None
+
+
 class TestTuyaWakeButton:
     """Test TuyaWakeButton entity."""
 
@@ -250,8 +308,11 @@ class TestEntitySetupEntry:
 
         mock_add_entities.assert_called_once()
         entities = mock_add_entities.call_args[0][0]
-        assert len(entities) == 1
-        assert type(entities[0]).__name__ == "TuyaMotionSensor"
+        assert len(entities) == 2
+        assert [type(e).__name__ for e in entities] == [
+            "TuyaMotionSensor",
+            "TuyaAwakeSensor",
+        ]
 
     @pytest.mark.asyncio
     async def test_button_setup_entry(

@@ -52,6 +52,7 @@ Copy `custom_components/tuya_peephole/` to your HA `config/custom_components/` d
 |--------|------|-------------|
 | `camera.tuya_peephole` | Camera | Live WebRTC video stream |
 | `binary_sensor.tuya_peephole_motion` | Binary Sensor | Motion detection |
+| `binary_sensor.tuya_peephole_camera_awake` | Binary Sensor | On while the camera is awake, off while sleeping (`camera_state` attribute shows sleeping/waking/awake) |
 | `sensor.tuya_peephole_battery` | Sensor | Battery percentage |
 | `sensor.tuya_peephole_signal_strength` | Sensor | Wi-Fi RSSI (disabled by default) |
 | `button.tuya_peephole_wake` | Button | Manual camera wake |
