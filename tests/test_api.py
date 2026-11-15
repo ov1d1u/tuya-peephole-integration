@@ -204,6 +204,87 @@ class TestPost:
             await api._post("/api/test", {})
 
 
+class TestSessionExpiry:
+    """Re-login and retry when Tuya reports an expired session."""
+
+    @staticmethod
+    def _session_invalid() -> TuyaApiError:
+        from custom_components.tuya_peephole.api import TuyaSessionExpiredError
+
+        return TuyaSessionExpiredError("API error unknown: USER_SESSION_INVALID")
+
+    @pytest.mark.asyncio
+    async def test_request_detects_session_invalid_in_error_msg(self) -> None:
+        """USER_SESSION_INVALID in errorMsg (no errorCode) is a session error."""
+        from custom_components.tuya_peephole.api import TuyaSessionExpiredError
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={"success": False, "errorMsg": "USER_SESSION_INVALID"}
+        )
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session = MagicMock(spec=aiohttp.ClientSession)
+        mock_session.post = MagicMock(return_value=mock_response)
+
+        api = _make_api(mock_session)
+        with pytest.raises(TuyaSessionExpiredError):
+            await api._request("/api/jarvis/config", {})
+
+    @pytest.mark.asyncio
+    async def test_post_relogins_and_retries(self) -> None:
+        """An expired session triggers one login and a retry of the request."""
+        api = _make_api()
+        api._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[self._session_invalid(), {"success": True, "result": 1}]
+        )
+        api.async_login = AsyncMock()  # type: ignore[method-assign]
+
+        resp = await api._post("/api/jarvis/config", {"devId": "x"})
+
+        assert resp == {"success": True, "result": 1}
+        api.async_login.assert_awaited_once_with(stale_generation=0)
+        assert api._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_post_retries_only_once(self) -> None:
+        """If the retry also fails with an expired session, the error propagates."""
+        api = _make_api()
+        api._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[self._session_invalid(), self._session_invalid()]
+        )
+        api.async_login = AsyncMock()  # type: ignore[method-assign]
+
+        with pytest.raises(TuyaApiError, match="USER_SESSION_INVALID"):
+            await api._post("/api/jarvis/config", {})
+        api.async_login.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_login_paths_do_not_relogin(self) -> None:
+        """Login endpoints never trigger a nested login."""
+        api = _make_api()
+        api._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=self._session_invalid()
+        )
+        api.async_login = AsyncMock()  # type: ignore[method-assign]
+
+        with pytest.raises(TuyaApiError):
+            await api._post("/api/login/token", {})
+        api.async_login.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_relogin_is_skipped(self) -> None:
+        """A re-login for an already-replaced session does not log in again."""
+        api = _make_api()
+        api._login_generation = 3
+        api._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("must not call the API")
+        )
+
+        assert await api.async_login(stale_generation=2) == {}
+
+
 class TestAsyncLogin:
     """Test async_login method."""
 

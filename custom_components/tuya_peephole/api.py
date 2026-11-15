@@ -22,6 +22,17 @@ from .exceptions import TuyaApiError, TuyaAuthError
 
 _LOGGER = logging.getLogger(__name__)
 
+# Error codes/messages Tuya returns when the web session (cookie) has expired
+# or was replaced by a login elsewhere. Recoverable by logging in again.
+_SESSION_INVALID_ERRORS = frozenset({"USER_SESSION_INVALID", "USER_SESSION_LOSS"})
+
+# Endpoints used by async_login itself; they must never trigger a re-login.
+_LOGIN_PATHS = frozenset({"/api/login/token", "/api/private/email/login"})
+
+
+class TuyaSessionExpiredError(TuyaApiError):
+    """Raised when the Tuya web session is no longer valid."""
+
 
 class TuyaSmartAPI:
     """Async Tuya Smart App API client.
@@ -60,6 +71,9 @@ class TuyaSmartAPI:
 
         # Login lock to prevent concurrent login race conditions
         self._login_lock = asyncio.Lock()
+        # Bumped on every successful login, so concurrent callers that hit an
+        # expired session re-login only once.
+        self._login_generation = 0
 
         # Caches for WebRTC and MQTT config (5-minute TTL)
         self._webrtc_cache: dict[str, Any] | None = None
@@ -72,6 +86,27 @@ class TuyaSmartAPI:
         self._message_cache_time: float = 0
 
     async def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        """POST JSON to Tuya Smart API, re-logging in once if the session expired.
+
+        Tuya can invalidate the web session before the proactive refresh
+        (e.g. when the same account logs in elsewhere). On
+        USER_SESSION_INVALID the client logs in again and retries the
+        request once.
+        """
+        generation = self._login_generation
+        try:
+            return await self._request(path, data)
+        except TuyaSessionExpiredError as err:
+            if path in _LOGIN_PATHS:
+                raise
+            _LOGGER.info(
+                "Tuya session expired (%s), logging in again and retrying %s",
+                err, path,
+            )
+            await self.async_login(stale_generation=generation)
+            return await self._request(path, data)
+
+    async def _request(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
         """POST JSON to Tuya Smart API and return parsed response.
 
         Args:
@@ -118,11 +153,20 @@ class TuyaSmartAPI:
             error_msg = result.get("errorMsg", str(result))
             if error_code in ("USER_PASSWD_WRONG", "USER_NOT_EXISTS"):
                 raise TuyaAuthError(f"Authentication failed: {error_msg}")
+            if (
+                error_code in _SESSION_INVALID_ERRORS
+                or error_msg in _SESSION_INVALID_ERRORS
+            ):
+                raise TuyaSessionExpiredError(
+                    f"API error {error_code}: {error_msg}"
+                )
             raise TuyaApiError(f"API error {error_code}: {error_msg}")
 
         return result
 
-    async def async_login(self, max_retries: int = 3) -> dict[str, Any]:
+    async def async_login(
+        self, max_retries: int = 3, stale_generation: int | None = None
+    ) -> dict[str, Any]:
         """Perform full Tuya login: token -> RSA encrypt password -> login.
 
         Step 1: POST /api/login/token to get token + RSA public key (pbKey).
@@ -130,6 +174,12 @@ class TuyaSmartAPI:
         Step 3: POST /api/private/email/login to get sid, uid, mobileMqttsUrl.
 
         Retries on SYSTEM_ERROR (Tuya API is intermittent for some regions).
+
+        Args:
+            max_retries: Attempts on SYSTEM_ERROR.
+            stale_generation: When re-logging in after an expired session,
+                the login generation the failed request used. If another
+                caller already logged in since then, the login is skipped.
 
         Returns:
             Login result dict containing sid, uid, domain info.
@@ -139,6 +189,12 @@ class TuyaSmartAPI:
             TuyaApiError: On network or API errors after all retries.
         """
         async with self._login_lock:
+            if (
+                stale_generation is not None
+                and stale_generation != self._login_generation
+            ):
+                return {}
+
             last_error: Exception | None = None
 
             for attempt in range(1, max_retries + 1):
@@ -182,6 +238,7 @@ class TuyaSmartAPI:
                     self.sid = result["sid"]
                     self.uid = result["uid"]
                     self.mqtt_url = result["domain"]["mobileMqttsUrl"]
+                    self._login_generation += 1
 
                     _LOGGER.debug(
                         "Tuya login successful for %s (uid=%s, attempt=%d)",
