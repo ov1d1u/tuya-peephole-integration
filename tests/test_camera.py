@@ -1,16 +1,14 @@
-"""Tests for TuyaPeepholeCamera entity (WebRTC SDP proxy lifecycle).
+"""Tests for TuyaPeepholeCamera entity.
 
-Tests entity properties, MQTT-aware availability, snapshot placeholder,
-WebRTC client configuration, session rejection, close session cleanup,
-ICE candidate forwarding, and signaling message handling.
+Tests entity properties, MQTT-aware availability, the stored snapshot,
+and the live stream source (local restream URL).
 
 Requirements covered: STRM-01, STRM-04, REL-04
 """
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -96,13 +94,15 @@ def _make_mock_coordinator(
     return coordinator
 
 
-def _make_camera(coordinator=None):
+def _make_camera(coordinator=None, options=None):
     """Create a TuyaPeepholeCamera instance with the given coordinator."""
     from custom_components.tuya_peephole.camera import TuyaPeepholeCamera
 
     if coordinator is None:
         coordinator = _make_mock_coordinator()
-    return TuyaPeepholeCamera(coordinator)
+    entry = MagicMock()
+    entry.options = options or {}
+    return TuyaPeepholeCamera(coordinator, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -204,430 +204,52 @@ class TestCameraSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# WebRTC client configuration tests
+# Live stream source
 # ---------------------------------------------------------------------------
 
 
-class TestWebRTCClientConfiguration:
-    """Tests for async_get_webrtc_client_configuration."""
+class TestStreamSource:
+    """stream_source() points Home Assistant at the local restream."""
 
-    def test_webrtc_client_config_with_ices(self) -> None:
-        """After _p2p_ices is populated, returns config with ICE servers."""
-        camera = _make_camera()
-        # Simulate populated _p2p_ices (normally set by _async_ensure_config)
-        camera._p2p_ices = [
-            {"urls": "stun:172.81.239.63:3478"},
-            {
-                "urls": "turn:172.81.239.63:3478",
-                "username": "u",
-                "credential": "c",
-            },
-        ]
+    def _restream(self):
+        from custom_components.tuya_peephole.restream import RestreamServer
 
-        config = camera.async_get_webrtc_client_configuration()
-        assert config.configuration is not None
-        assert len(config.configuration.ice_servers) == 2
-        assert config.configuration.ice_servers[0].urls == "stun:172.81.239.63:3478"
-        assert config.configuration.ice_servers[1].urls == "turn:172.81.239.63:3478"
-        assert config.configuration.ice_servers[1].username == "u"
-        assert config.configuration.ice_servers[1].credential == "c"
-
-    def test_webrtc_client_config_no_ices(self) -> None:
-        """When _p2p_ices is None, returns config with empty ice_servers."""
-        camera = _make_camera()
-        camera._p2p_ices = None
-
-        config = camera.async_get_webrtc_client_configuration()
-        assert config.configuration is not None
-        assert len(config.configuration.ice_servers) == 0
-
-    def test_webrtc_client_config_empty_ices(self) -> None:
-        """When _p2p_ices is empty list, returns config with empty ice_servers."""
-        camera = _make_camera()
-        camera._p2p_ices = []
-
-        config = camera.async_get_webrtc_client_configuration()
-        assert config.configuration is not None
-        assert len(config.configuration.ice_servers) == 0
-
-
-# ---------------------------------------------------------------------------
-# Session rejection tests
-# ---------------------------------------------------------------------------
-
-
-class TestSessionTakeover:
-    """A new WebRTC offer replaces whatever session is active."""
+        server = RestreamServer(MagicMock(), MagicMock())
+        server._port = 40000
+        return server
 
     @pytest.mark.asyncio
-    async def test_new_offer_replaces_active_session(self) -> None:
+    async def test_defaults_to_h264(self) -> None:
         coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera.hass = MagicMock()
-        camera.hass.async_create_task = MagicMock(side_effect=lambda c: c.close())
-        old_task = MagicMock()
-        old_task.done.return_value = False
-        old_send = MagicMock()
-        camera._session_id = "existing_session"
-        camera._signaling_id = "sig123"
-        camera._uid = "abc123def456"
-        camera._moto_id = "moto_cnpre002"
-        camera._send_message = old_send
-        camera._signaling_task = old_task
-        camera._signaling_cb = MagicMock()
-        camera._pending_candidates = ["a=candidate:old"]
-
-        send_message = MagicMock()
-        await camera.async_handle_async_webrtc_offer(
-            offer_sdp="v=0\r\n",
-            session_id="new_session",
-            send_message=send_message,
-        )
-
-        # old session: camera told to hang up, task stopped, MQTT released
-        msg = json.loads(coordinator.mqtt_client.publish.call_args[0][1])
-        assert msg["data"]["header"]["type"] == "disconnect"
-        assert msg["data"]["header"]["sessionid"] == "sig123"
-        old_task.cancel.assert_called_once()
-        coordinator.mqtt_client.unsubscribe.assert_called_once()
-        # new session took over, with no error sent to the new viewer
-        assert camera._session_id == "new_session"
-        assert camera._send_message is send_message
-        assert camera._pending_candidates == []
-        send_message.assert_not_called()
-        camera.hass.async_create_task.assert_called_once()
+        coordinator.restream = self._restream()
+        url = await _make_camera(coordinator).stream_source()
+        assert url.startswith("http://127.0.0.1:40000/")
+        assert url.endswith("/h264.ts")
 
     @pytest.mark.asyncio
-    async def test_session_closed_before_config_frees_camera(self) -> None:
-        """Closing during the wake wait (no config yet) still resets state."""
-        camera = _make_camera()
-        camera.hass = MagicMock()
-        camera._session_id = "early"
-        camera._uid = None
-        camera._signaling_task = MagicMock()
-        camera._signaling_task.done.return_value = False
-
-        camera.close_webrtc_session("early")
-
-        assert camera._session_id is None
-        assert camera._signaling_task is None
-
-
-# ---------------------------------------------------------------------------
-# Close session tests
-# ---------------------------------------------------------------------------
-
-
-class TestCloseSession:
-    """Tests for close_webrtc_session cleanup."""
-
-    def _make_camera_with_active_session(self):
-        """Create a camera with an active signaling session."""
+    async def test_hevc_option(self) -> None:
         coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera._session_id = "test_session_abc"
-        camera._signaling_id = "sig123"
-        camera._uid = "abc123def456"
-        camera._moto_id = "moto_cnpre002"
-        camera._send_message = MagicMock()
-        camera._signaling_cb = MagicMock()  # set once subscribed
-        # Mock signaling task as done (to avoid cancel issues)
-        camera._signaling_task = MagicMock()
-        camera._signaling_task.done.return_value = True
-        return camera, coordinator
-
-    def test_close_session_sends_disconnect(self) -> None:
-        """close_webrtc_session publishes disconnect message to MQTT."""
-        camera, coordinator = self._make_camera_with_active_session()
-
-        camera.close_webrtc_session("test_session_abc")
-
-        mqtt_client = coordinator.mqtt_client
-        mqtt_client.publish.assert_called_once()
-        # Verify the publish was a disconnect message
-        call_args = mqtt_client.publish.call_args
-        topic = call_args[0][0]
-        payload_bytes = call_args[0][1]
-        assert "/av/moto/moto_cnpre002/" in topic
-        msg = json.loads(payload_bytes)
-        assert msg["data"]["header"]["type"] == "disconnect"
-
-    def test_close_session_unsubscribes(self) -> None:
-        """close_webrtc_session calls message_callback_remove and unsubscribe."""
-        camera, coordinator = self._make_camera_with_active_session()
-
-        camera.close_webrtc_session("test_session_abc")
-
-        mqtt_client = coordinator.mqtt_client
-        mqtt_client.message_callback_remove.assert_called_once()
-        mqtt_client.unsubscribe.assert_called_once()
-
-    def test_close_session_resets_state(self) -> None:
-        """After close, session state is cleared."""
-        camera, _coord = self._make_camera_with_active_session()
-
-        camera.close_webrtc_session("test_session_abc")
-
-        assert camera._session_id is None
-        assert camera._send_message is None
-        assert camera._signaling_id is None
-        assert camera._signaling_task is None
-
-    def test_close_wrong_session_noop(self) -> None:
-        """close_webrtc_session with wrong session_id does nothing."""
-        camera, coordinator = self._make_camera_with_active_session()
-
-        camera.close_webrtc_session("wrong_session_xyz")
-
-        # Nothing should be published or changed
-        coordinator.mqtt_client.publish.assert_not_called()
-        assert camera._session_id == "test_session_abc"
-        assert camera._signaling_id == "sig123"
-
-
-# ---------------------------------------------------------------------------
-# ICE candidate forwarding tests
-# ---------------------------------------------------------------------------
-
-
-class TestICECandidateForwarding:
-    """Tests for async_on_webrtc_candidate forwarding."""
+        coordinator.restream = self._restream()
+        camera = _make_camera(coordinator, options={"live_codec": "hevc"})
+        assert (await camera.stream_source()).endswith("/hevc.ts")
 
     @pytest.mark.asyncio
-    async def test_on_webrtc_candidate_publishes(self) -> None:
-        """async_on_webrtc_candidate publishes formatted candidate to MQTT."""
-        from webrtc_models import RTCIceCandidateInit
-
+    async def test_no_restream_yet(self) -> None:
         coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera._session_id = "sess_abc"
-        camera._signaling_id = "sig456"
-        camera._uid = "abc123def456"
-        camera._moto_id = "moto_cnpre002"
-
-        candidate = RTCIceCandidateInit(
-            candidate="candidate:1 1 udp 2113937151 192.168.1.1 5000 typ host"
-        )
-
-        await camera.async_on_webrtc_candidate("sess_abc", candidate)
-
-        mqtt_client = coordinator.mqtt_client
-        mqtt_client.publish.assert_called_once()
-        # Verify the published message contains the formatted candidate
-        call_args = mqtt_client.publish.call_args
-        payload_bytes = call_args[0][1]
-        msg = json.loads(payload_bytes)
-        assert msg["data"]["header"]["type"] == "candidate"
-        # format_candidate_for_camera prepends "a=" prefix
-        assert msg["data"]["msg"]["candidate"].startswith("a=candidate:")
+        coordinator.restream = None
+        assert await _make_camera(coordinator).stream_source() is None
 
     @pytest.mark.asyncio
-    async def test_on_webrtc_candidate_wrong_session(self) -> None:
-        """Candidate for non-matching session is ignored."""
+    async def test_does_not_wake_camera(self) -> None:
+        """Only reading the URL connects the camera, not asking for it."""
         coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera._session_id = "sess_abc"
+        coordinator.restream = self._restream()
+        await _make_camera(coordinator).stream_source()
+        coordinator.async_wake_camera.assert_not_awaited()
 
-        from webrtc_models import RTCIceCandidateInit
+    def test_no_native_webrtc(self) -> None:
+        """Native WebRTC would bypass the restream (and send the browser
+        H.265 labelled as H.264)."""
+        from custom_components.tuya_peephole.camera import TuyaPeepholeCamera
 
-        candidate = RTCIceCandidateInit(candidate="candidate:1 1 udp")
-
-        await camera.async_on_webrtc_candidate("wrong_session", candidate)
-
-        coordinator.mqtt_client.publish.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_candidate_before_offer_is_queued(self) -> None:
-        """Candidates arriving while the camera wakes are kept, not dropped."""
-        coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera._session_id = "sess_abc"
-        camera._uid = None
-        camera._moto_id = None
-
-        from webrtc_models import RTCIceCandidateInit
-
-        candidate = RTCIceCandidateInit(candidate="candidate:1 1 udp")
-
-        await camera.async_on_webrtc_candidate("sess_abc", candidate)
-
-        coordinator.mqtt_client.publish.assert_not_called()
-        assert camera._pending_candidates == ["a=candidate:1 1 udp"]
-
-    @pytest.mark.asyncio
-    async def test_queued_candidates_sent_after_offer(self) -> None:
-        coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-        camera.hass = MagicMock()
-        camera.hass.async_create_task = MagicMock(side_effect=lambda c: c.close())
-        coordinator.api.invalidate_cache = MagicMock()  # sync in the real API
-
-        await camera.async_handle_async_webrtc_offer(
-            offer_sdp="v=0\r\n", session_id="sess_abc", send_message=MagicMock()
-        )
-        from webrtc_models import RTCIceCandidateInit
-
-        await camera.async_on_webrtc_candidate(
-            "sess_abc", RTCIceCandidateInit(candidate="candidate:1 1 udp")
-        )
-        assert coordinator.mqtt_client.publish.call_count == 0
-
-        with patch(
-            "custom_components.tuya_peephole.camera.WEBRTC_SESSION_TIMEOUT", 0.01
-        ):
-            await camera._async_webrtc_signaling("v=0\r\n")
-
-        types = [
-            json.loads(c[0][1])["data"]["header"]["type"]
-            for c in coordinator.mqtt_client.publish.call_args_list
-        ]
-        assert types[:2] == ["offer", "candidate"]
-
-
-# ---------------------------------------------------------------------------
-# Signaling message handling tests
-# ---------------------------------------------------------------------------
-
-
-class TestSignalingMessageHandling:
-    """Tests for _on_signaling_message callback."""
-
-    def _make_signaling_message(
-        self,
-        msg_type="answer",
-        signaling_id="sig123",
-        msg_payload=None,
-    ) -> bytes:
-        """Build a protocol 302 signaling message for testing."""
-        if msg_payload is None:
-            if msg_type == "answer":
-                msg_payload = {"sdp": "v=0\r\nanswer_sdp_from_camera"}
-            elif msg_type == "candidate":
-                msg_payload = {
-                    "candidate": "a=candidate:1 1 udp 2113937151 10.0.0.1 5000 typ host\r\n"
-                }
-            else:
-                msg_payload = {}
-
-        message = {
-            "protocol": 302,
-            "pv": "2.2",
-            "t": 1700000000,
-            "data": {
-                "header": {
-                    "type": msg_type,
-                    "from": "device_xyz",
-                    "to": "uid_abc",
-                    "sessionid": signaling_id,
-                    "moto_id": "moto_test",
-                },
-                "msg": msg_payload,
-            },
-        }
-        return json.dumps(message, separators=(",", ":")).encode("utf-8")
-
-    def test_on_signaling_answer(self) -> None:
-        """_on_signaling_message with answer type calls send_message(WebRTCAnswer)."""
-        camera = _make_camera()
-        send_message = MagicMock()
-        camera._send_message = send_message
-
-        payload = self._make_signaling_message("answer", "sig123")
-        camera._on_signaling_message(payload, "sig123")
-
-        send_message.assert_called_once()
-        answer = send_message.call_args[0][0]
-        assert answer.answer == "v=0\r\nanswer_sdp_from_camera"
-
-    def test_on_signaling_answer_sets_event(self) -> None:
-        """_on_signaling_message with answer type sets _answer_event."""
-        camera = _make_camera()
-        camera._send_message = MagicMock()
-
-        assert not camera._answer_event.is_set()
-
-        payload = self._make_signaling_message("answer", "sig123")
-        camera._on_signaling_message(payload, "sig123")
-
-        assert camera._answer_event.is_set()
-
-    def test_on_signaling_candidate(self) -> None:
-        """_on_signaling_message with candidate calls send_message(WebRTCCandidate)."""
-        camera = _make_camera()
-        send_message = MagicMock()
-        camera._send_message = send_message
-
-        payload = self._make_signaling_message("candidate", "sig123")
-        camera._on_signaling_message(payload, "sig123")
-
-        send_message.assert_called_once()
-        candidate_msg = send_message.call_args[0][0]
-        # WebRTCCandidate wraps RTCIceCandidateInit
-        # clean_candidate_from_camera strips "a=" prefix and "\r\n" suffix
-        assert candidate_msg.candidate.candidate == (
-            "candidate:1 1 udp 2113937151 10.0.0.1 5000 typ host"
-        )
-
-    def test_on_signaling_wrong_session(self) -> None:
-        """Message with wrong session ID is ignored (parse returns None)."""
-        camera = _make_camera()
-        send_message = MagicMock()
-        camera._send_message = send_message
-
-        payload = self._make_signaling_message("answer", "other_session")
-        camera._on_signaling_message(payload, "my_session")
-
-        send_message.assert_not_called()
-
-    def test_on_signaling_no_send_message(self) -> None:
-        """Answer message is ignored if _send_message is None."""
-        camera = _make_camera()
-        camera._send_message = None
-
-        payload = self._make_signaling_message("answer", "sig123")
-        # Should not raise
-        camera._on_signaling_message(payload, "sig123")
-
-
-# ---------------------------------------------------------------------------
-# Config caching tests
-# ---------------------------------------------------------------------------
-
-
-class TestConfigCaching:
-    """Tests for _async_ensure_config caching behavior."""
-
-    @pytest.mark.asyncio
-    async def test_ensure_config_fetches_once(self) -> None:
-        """_async_ensure_config calls API only once (caches result)."""
-        coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-
-        await camera._async_ensure_config()
-        await camera._async_ensure_config()  # second call should use cache
-
-        coordinator.api.async_get_webrtc_config.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_ensure_config_uses_connection_msid(self) -> None:
-        """uid comes from the live MQTT connection, not a fresh API msid."""
-        coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-
-        await camera._async_ensure_config()
-
-        assert camera._uid == coordinator.msid
-        coordinator.api.async_get_mqtt_config.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_ensure_config_populates_fields(self) -> None:
-        """_async_ensure_config populates _uid, _moto_id, _auth, _p2p_ices."""
-        coordinator = _make_mock_coordinator()
-        camera = _make_camera(coordinator)
-
-        await camera._async_ensure_config()
-
-        assert camera._uid == "abc123def456"
-        assert camera._moto_id == "moto_cnpre002"
-        assert camera._auth == "U+qtvRP+testauth"
-        assert len(camera._p2p_ices) == 2
+        assert "async_handle_async_webrtc_offer" not in vars(TuyaPeepholeCamera)

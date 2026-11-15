@@ -13,7 +13,7 @@ import struct
 import time as _time
 import zlib
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
@@ -28,8 +28,12 @@ from .const import (
     WAKE_COOLDOWN,
     WAKE_TIMEOUT,
 )
+from .live_stream import LiveStream
 from .models import CameraState, TuyaMQTTMessage
 from .mqtt import TuyaMQTTClient
+
+if TYPE_CHECKING:
+    from .restream import RestreamServer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -93,6 +97,10 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._snapshot_lock = asyncio.Lock()
         self.last_snapshot: bytes | None = None
         self.last_snapshot_time: float | None = None  # wall-clock epoch seconds
+
+        # Shared on-demand camera stream and its local MPEG-TS restream
+        self.live_stream = LiveStream(self)
+        self.restream: RestreamServer | None = None
 
     async def async_connect_mqtt(self) -> None:
         """Connect to Tuya MQTT broker.
@@ -199,6 +207,10 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._camera_state = CameraState.SLEEPING
             self._awake_event.clear()
             self._sleep_event.set()
+        elif message.is_link_change:
+            # Asleep, or about to confirm waking with DPS 149 = true; either
+            # way a wake must now wait for that confirmation.
+            self.mark_camera_asleep("cloud link changed")
         elif message.is_wireless_awake:
             if self._camera_state != CameraState.AWAKE:
                 _LOGGER.info("Camera wake confirmed via MQTT")
@@ -408,6 +420,11 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._motion_clear_unsub()
             self._motion_clear_unsub = None
 
+        if self.restream is not None:
+            await self.restream.async_stop()
+            self.restream = None
+        await self.live_stream.async_shutdown()
+
         if self.mqtt_client is not None:
             await self.mqtt_client.async_disconnect()
             self.mqtt_client = None
@@ -455,6 +472,18 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def is_charging(self) -> bool:
         """Return True if camera appears to be on charger."""
         return self._charging_detected
+
+    def mark_camera_asleep(self, reason: str) -> None:
+        """Stop assuming the camera is awake, so the next wake waits for it.
+
+        A sleeping camera still answers WebRTC signaling but sends no video,
+        so a wake that skips confirmation leaves the stream empty.
+        """
+        if self._camera_state == CameraState.AWAKE:
+            _LOGGER.debug("Camera may be asleep (%s)", reason)
+            self._camera_state = CameraState.SLEEPING
+            self._awake_event.clear()
+            self.async_set_updated_data(self._build_state_dict())
 
     @property
     def camera_state(self) -> CameraState:

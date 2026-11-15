@@ -524,3 +524,68 @@ class TestSleepSignal:
 
         assert result is True
         coordinator.mqtt_client.publish.assert_called_once()
+
+
+# The camera's cloud link coming back up. Seen alone (without the DPS 149
+# false / online false before it) when the camera fell asleep, and also
+# just before DPS 149 true when it wakes.
+_LINK_UP = (
+    b'{"data":{"devId":"test_device","online":true,'
+    b'"lastOnlineChangeTime":1794764040743,"gwId":"test_device"},'
+    b'"protocol":1,"s":764040904,"t":1794764040,"type":"update"}'
+)
+
+
+class TestLinkChange:
+    """A link change means the camera can no longer be assumed awake."""
+
+    def test_link_up_is_a_link_change_not_a_wake(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        msg = TuyaMQTTMessage.parse(_TOPIC, _LINK_UP)
+        assert msg.is_link_change is True
+        assert msg.is_wireless_awake is False
+        assert msg.is_sleep_signal is False
+        assert TuyaMQTTMessage.parse(_TOPIC, _WAKE_DPS).is_link_change is False
+
+    def test_missed_sleep_signal(self, mock_hass_with_loop) -> None:
+        """Only the final link-up arrives: the camera is treated as asleep."""
+        from custom_components.tuya_peephole.models import (
+            CameraState,
+            TuyaMQTTMessage,
+        )
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator._camera_state = CameraState.AWAKE
+        coordinator._awake_event.set()
+
+        coordinator._handle_mqtt_message(TuyaMQTTMessage.parse(_TOPIC, _LINK_UP))
+
+        assert coordinator.camera_state == CameraState.SLEEPING
+        assert not coordinator._awake_event.is_set()
+
+    def test_wake_sequence_ends_awake(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.models import (
+            CameraState,
+            TuyaMQTTMessage,
+        )
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        for payload in (_LINK_UP, _WAKE_DPS):
+            coordinator._handle_mqtt_message(TuyaMQTTMessage.parse(_TOPIC, payload))
+
+        assert coordinator.camera_state == CameraState.AWAKE
+        assert coordinator._awake_event.is_set()
+
+    def test_mark_camera_asleep(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.models import CameraState
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator.async_set_updated_data = MagicMock()
+        coordinator._camera_state = CameraState.AWAKE
+        coordinator.mark_camera_asleep("test")
+        assert coordinator.camera_state == CameraState.SLEEPING
+        coordinator.async_set_updated_data.assert_called_once()
+
+        coordinator.mark_camera_asleep("again")  # already asleep: no update
+        coordinator.async_set_updated_data.assert_called_once()

@@ -20,18 +20,21 @@ from .api import TuyaSmartAPI
 from .const import (
     CONF_DEVICE_ID,
     CONF_EMAIL,
+    CONF_LIVE_CODEC,
     CONF_LOCAL_KEY,
     CONF_PASSWORD,
     CONF_REGION,
+    DEFAULT_LIVE_CODEC,
     DOMAIN,
     RECORDING_DURATION,
     REGIONS,
     RETENTION_DAYS,
     TOKEN_REFRESH_HOURS,
 )
-from .recorder import RecordingManager
 from .coordinator import TuyaPeepholeCoordinator
 from .exceptions import TuyaApiError, TuyaAuthError
+from .recorder import RecordingManager
+from .restream import RestreamServer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +83,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
+    # Local MPEG-TS restream for the camera entity's stream_source()
+    coordinator.restream = RestreamServer(hass, coordinator.live_stream)
+    await coordinator.restream.async_start()
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     # Forward entity platforms (binary_sensor, button)
@@ -123,10 +130,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][f"{entry.entry_id}_recorder"] = recording_manager
 
     # Listen for options changes
+    live_codec = entry.options.get(CONF_LIVE_CODEC, DEFAULT_LIVE_CODEC)
+
     async def _async_options_updated(
         hass_ref: HomeAssistant, entry_ref: ConfigEntry
     ) -> None:
-        """Update recording manager when options change."""
+        """Update recording manager when options change.
+
+        A new live view codec changes the camera's stream URL, which Home
+        Assistant only picks up when the entry reloads.
+        """
+        if (
+            entry_ref.options.get(CONF_LIVE_CODEC, DEFAULT_LIVE_CODEC)
+            != live_codec
+        ):
+            hass_ref.config_entries.async_schedule_reload(entry_ref.entry_id)
+            return
         rec_mgr: RecordingManager | None = hass_ref.data.get(DOMAIN, {}).get(
             f"{entry_ref.entry_id}_recorder"
         )

@@ -54,15 +54,17 @@
   "options": {
     "step": {
       "init": {
-        "title": "Recording Settings",
+        "title": "Recording and Live View Settings",
         "data": {
           "recording_enabled": "Enable recording",
           "retention_days": "Retention (days)",
-          "recording_duration": "Recording duration (seconds)"
+          "recording_duration": "Recording duration (seconds)",
+          "live_codec": "Live view codec"
         },
         "data_description": {
           "retention_days": "Recordings older than this will be automatically deleted (1-30 days)",
-          "recording_duration": "Duration of each motion-triggered recording (10-300 seconds)"
+          "recording_duration": "Duration of each motion-triggered recording (10-300 seconds)",
+          "live_codec": "h264 plays in every browser but uses some CPU to convert the camera's video. hevc passes the camera's H.265 through unchanged (no extra CPU), but only plays where H.265 decoding is available (Safari, or Chrome/Edge on supported hardware)."
         }
       }
     }

@@ -66,3 +66,10 @@ CONTINUOUS_RECONNECT_MIN = 5  # seconds, initial backoff for continuous mode rec
 CONTINUOUS_RECONNECT_MAX = 120  # seconds, max backoff
 CHARGING_STABLE_MINUTES = 5  # battery=100 sustained this long implies charging
 RECORDING_STORAGE_SUBDIR = "tuya_peephole"  # under hass.config.path("media/")
+
+# Live view (local restream): "h264" transcodes for every browser, "hevc"
+# passes the camera's H.265 through (less CPU, needs an H.265-capable player)
+CONF_LIVE_CODEC = "live_codec"
+LIVE_CODEC_H264 = "h264"
+LIVE_CODEC_HEVC = "hevc"
+DEFAULT_LIVE_CODEC = LIVE_CODEC_H264

@@ -4,7 +4,7 @@ Custom Home Assistant integration for battery-powered Wi-Fi peephole cameras bas
 
 ## Features
 
-- **Live Video Stream** — WebRTC video directly in HA dashboard via Tuya MQTT signaling
+- **Live Video Stream** — plays in every browser through Home Assistant (H.264, or the camera's H.265 passed through); the camera is connected only while someone watches
 - **Camera Wake** — Wake sleeping battery camera on demand
 - **Motion Detection** — Real-time motion alerts via MQTT push (no polling)
 - **Snapshot** — On-demand image grabbed from the live WebRTC stream; the camera entity shows the last one (no automatic captures, to save battery)
@@ -50,7 +50,7 @@ Copy `custom_components/tuya_peephole/` to your HA `config/custom_components/` d
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| `camera.tuya_peephole` | Camera | Live WebRTC video stream |
+| `camera.tuya_peephole` | Camera | Live video stream |
 | `binary_sensor.tuya_peephole_motion` | Binary Sensor | Motion detection |
 | `sensor.tuya_peephole_battery` | Sensor | Battery percentage |
 | `sensor.tuya_peephole_signal_strength` | Sensor | Wi-Fi RSSI (disabled by default) |
@@ -61,8 +61,9 @@ Copy `custom_components/tuya_peephole/` to your HA `config/custom_components/` d
 
 - Uses **Tuya Smart App API** (`protect-eu.ismartlife.me`) — no IoT Platform quota limits
 - **MQTT** for real-time events and WebRTC signaling (push-only, no polling)
-- **WebRTC SDP proxy** — browser connects directly to camera, HA relays signaling
-- **aiortc** for server-side recording (motion-triggered MP4 capture)
+- **Datachannel media** — the camera's regular WebRTC tracks carry H.265 labelled as H.264, which browsers cannot play. HA connects with **aiortc** and asks the camera for its datachannel stream instead, which carries standard H.265 RTP
+- **One shared stream** — live view, recordings and snapshots read the same camera session, which starts on demand and disconnects 10 s after the last viewer
+- **Local restream** — the camera entity's stream source is an MPEG-TS stream served on `127.0.0.1`, played by HA's go2rtc (or its HLS player). Choose the codec in the integration options: `h264` (default, plays everywhere, uses some CPU) or `hevc` (no transcoding, needs an H.265-capable browser)
 - **paho-mqtt 2.1** with AsyncioHelper pattern for HA event loop integration
 
 ## Requirements
