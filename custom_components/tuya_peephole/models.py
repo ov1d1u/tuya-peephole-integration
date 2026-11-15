@@ -6,14 +6,50 @@ TuyaMQTTMessage parser for incoming MQTT payloads.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 from enum import Enum
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
 # DPS the camera sets true on waking and false on going to sleep
 DPS_AWAKE = "149"
+
+# DPS that carry event notifications as base64-encoded JSON, e.g.
+# {"cmd":"ipc_motion","type":"image","alarm":true,...}. Peepholes use 212
+# (initiative_message); other Tuya cameras use 115 (movement_detect_pic)
+# and 185 (alarm_message).
+DPS_MOTION_EVENTS = ("212", "115", "185")
+
+# Substrings of an event's "cmd" that mean motion or a person at the door
+MOTION_EVENT_CMDS = ("motion", "pir", "human", "door_lock_video")
+
+
+def _is_motion_event_value(value: Any) -> bool:
+    """Check whether a DPS event value describes a motion event.
+
+    Values are usually base64-encoded JSON; plain JSON and plain
+    strings are accepted too.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    text = value
+    if not value.lstrip().startswith("{"):
+        try:
+            text = base64.b64decode(value, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError):
+            text = value
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return any(cmd in text.lower() for cmd in MOTION_EVENT_CMDS)
+    if not isinstance(event, dict):
+        return False
+    cmd = str(event.get("cmd", "")).lower()
+    return any(key in cmd for key in MOTION_EVENT_CMDS)
 
 
 class CameraState(Enum):
@@ -114,8 +150,9 @@ class TuyaMQTTMessage:
 
         Detects motion via:
         - Protocol 56 with warnLevel (Tuya alarm/motion event)
-        - DPS key 212 with door_lock_video (doorbell/peephole event)
-        - PIR/alarm keywords in data dict or raw text
+        - DPS 212/115/185 event payloads (base64 JSON such as
+          {"cmd":"ipc_motion","alarm":true,...})
+        - PIR/alarm keys in the data dict, or keywords in non-JSON text
         """
         if self._json is not None:
             # Protocol 56 = alarm/motion event from Tuya
@@ -124,20 +161,22 @@ class TuyaMQTTMessage:
                 if isinstance(data, dict) and data.get("warnLevel"):
                     return True
 
-            # DPS 212 with door_lock_video = doorbell press / motion capture
             data = self._json.get("data", {})
             if isinstance(data, dict):
                 dps = data.get("dps", {})
                 if isinstance(dps, dict):
-                    dps_212 = dps.get("212", "")
-                    if isinstance(dps_212, str) and "door_lock_video" in dps_212:
-                        return True
+                    for dp in DPS_MOTION_EVENTS:
+                        if _is_motion_event_value(dps.get(dp)):
+                            return True
                 # Check data dict for motion-related keys
                 for key in data:
                     if key in ("pir", "alarm_message", "movement_detect_pic"):
                         return True
+            # JSON payloads carry base64 values that can contain these
+            # keywords by chance, so the raw-text fallback is not used
+            return False
 
-        # Fallback: substring match in raw text
+        # Fallback for non-JSON payloads: substring match in raw text
         text_lower = self._text.lower()
         return any(
             keyword in text_lower

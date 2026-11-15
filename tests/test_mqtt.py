@@ -258,6 +258,74 @@ class TestTuyaMQTTClientOperations:
         assert parsed_msg.is_wireless_awake is False
 
 
+def _dps_message(dps: dict) -> bytes:
+    import json
+
+    return json.dumps(
+        {"protocol": 4, "t": 1794742578, "data": {"dps": dps}}
+    ).encode()
+
+
+def _b64_event(event: dict) -> str:
+    import base64
+    import json
+
+    return base64.b64encode(json.dumps(event).encode()).decode()
+
+
+class TestMotionParsing:
+    """Motion detection from the camera's DPS event payloads."""
+
+    # Shape of the event a real peephole sent on PIR motion (DPS 212)
+    IPC_MOTION_EVENT = {
+        "v": "4.0",
+        "bucket": "ty-eu-storage30",
+        "cmd": "ipc_motion",
+        "type": "image",
+        "with": "resource",
+        "alarm": True,
+        "time": 1794742578,
+        "files": [["/bf6127/1794742578.jpeg", "abcdef0123456789"]],
+    }
+
+    @pytest.mark.parametrize("dp", ["212", "115", "185"])
+    def test_base64_ipc_motion_event_is_motion(self, dp: str) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        payload = _dps_message({dp: _b64_event(self.IPC_MOTION_EVENT)})
+        assert TuyaMQTTMessage.parse("t", payload).is_motion is True
+
+    def test_door_lock_video_event_is_motion(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        event = {"cmd": "ipc_door_lock_video", "alarm": True}
+        payload = _dps_message({"212": _b64_event(event)})
+        assert TuyaMQTTMessage.parse("t", payload).is_motion is True
+
+    def test_non_motion_event_is_not_motion(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        event = {"cmd": "ipc_low_battery", "alarm": True}
+        payload = _dps_message({"212": _b64_event(event)})
+        assert TuyaMQTTMessage.parse("t", payload).is_motion is False
+
+    @pytest.mark.parametrize(
+        "dps",
+        [{"149": True}, {"104": True}, {"109": "32735296|584928|32150368"}],
+    )
+    def test_wake_dps_are_not_motion(self, dps: dict) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        assert TuyaMQTTMessage.parse("t", _dps_message(dps)).is_motion is False
+
+    def test_keyword_inside_base64_is_not_motion(self) -> None:
+        """A base64 blob that happens to contain 'pir' is not a motion event."""
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        payload = _dps_message({"999": "aGVsbG8PIRxyz=="})
+        assert TuyaMQTTMessage.parse("t", payload).is_motion is False
+
+
 class TestTuyaMQTTClientDisconnect:
     """Test MQTT client disconnection."""
 
