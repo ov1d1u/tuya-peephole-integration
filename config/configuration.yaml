@@ -1,0 +1,18 @@
+# Local development configuration for the Tuya Peephole integration.
+# Everything else in this directory (.storage, logs, DB, recordings) is gitignored.
+default_config:
+
+http:
+  # 8123 is commonly taken by another local instance; override here if needed.
+  server_port: 8124
+
+logger:
+  default: info
+  logs:
+    custom_components.tuya_peephole: debug
+    aiortc: info
+    aioice: info
+
+homeassistant:
+  name: Tuya Peephole Dev
+  debug: true

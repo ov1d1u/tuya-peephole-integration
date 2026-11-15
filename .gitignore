@@ -22,3 +22,8 @@ PROMPT.md
 CLAUDE.md
 auth_example.py
 secrets.env.example
+
+# Local Home Assistant dev environment (scripts/setup, scripts/develop)
+.venv/
+config/*
+!config/configuration.yaml

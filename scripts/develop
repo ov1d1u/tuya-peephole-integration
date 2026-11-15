@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run Home Assistant against ./config with the integration loaded from the working tree.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ ! -x .venv/bin/hass ]]; then
+  echo "No dev environment found; run scripts/setup first." >&2
+  exit 1
+fi
+
+mkdir -p config/custom_components
+ln -sfn ../../custom_components/tuya_peephole config/custom_components/tuya_peephole
+
+exec .venv/bin/hass --config config --debug "$@"

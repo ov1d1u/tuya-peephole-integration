@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Create a local Home Assistant dev environment in .venv and link the integration into config/.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+PYTHON="${PYTHON:-python3.14}"
+HA_VERSION="${HA_VERSION:-}"   # e.g. HA_VERSION=2026.11.1; empty = latest
+
+uv venv --python "$PYTHON" --allow-existing .venv
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+uv pip install "homeassistant${HA_VERSION:+==$HA_VERSION}"
+# Integration requirements (from manifest.json) and test tooling
+uv pip install "paho-mqtt==2.1.0" "aiortc>=1.14.0" pytest pytest-asyncio ruff
+# stream/camera requirements HA would otherwise install on first camera load
+uv pip install numpy PyTurboJPEG
+
+mkdir -p config/custom_components
+ln -sfn ../../custom_components/tuya_peephole config/custom_components/tuya_peephole
+
+echo "Done. Start Home Assistant with: scripts/develop"
