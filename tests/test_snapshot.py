@@ -11,117 +11,80 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.tuya_peephole.live_stream import StreamClosedError
 
-class _FakeTrack:
-    """Video track that yields the given frames, then ends."""
-
-    kind = "video"
-
-    def __init__(self, frames, end_exc=Exception("track ended")):
-        self._frames = list(frames)
-        self._end_exc = end_exc
-
-    async def recv(self):
-        if self._frames:
-            return self._frames.pop(0)
-        raise self._end_exc
+from .test_hevc_stream import FIXTURE_PICTURES, _depacketize, _packets
 
 
-class _HangingTrack:
-    """Video track that yields frames, then waits forever."""
+class _FakeReader:
+    """StreamReader stand-in: yields access units, then hangs or ends."""
 
-    kind = "video"
+    def __init__(self, units, end: bool = False) -> None:
+        self._units = list(units)
+        self._end = end
+        self.closed = False
 
-    def __init__(self, frames):
-        self._frames = list(frames)
-
-    async def recv(self):
-        if self._frames:
-            return self._frames.pop(0)
+    async def get(self):
+        if self._units:
+            return self._units.pop(0)
+        if self._end:
+            raise StreamClosedError
         await asyncio.Event().wait()
 
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 # ---------------------------------------------------------------------------
-# SnapshotSession frame handling
+# Reading a frame from the live stream
 # ---------------------------------------------------------------------------
 
 
-class TestSnapshotSessionFrames:
-    """Frame selection inside SnapshotSession."""
+class TestReadFrame:
+    """async_read_frame decodes until the picture has settled."""
 
     @pytest.mark.asyncio
-    async def test_skips_settling_frames(self, mock_recording_coordinator) -> None:
-        """Returns the first frame after SNAPSHOT_SKIP_FRAMES frames."""
+    async def test_skips_unsettled_frames(self, mock_hass_with_loop) -> None:
         from custom_components.tuya_peephole.const import SNAPSHOT_SKIP_FRAMES
-        from custom_components.tuya_peephole.snapshot import SnapshotSession
+        from custom_components.tuya_peephole.snapshot import async_read_frame
 
-        session = SnapshotSession(mock_recording_coordinator)
-        frames = [f"frame{i}" for i in range(SNAPSHOT_SKIP_FRAMES + 3)]
-        await session._async_on_video_track(_HangingTrack(frames))
+        units = _depacketize(_packets())
+        reader = _FakeReader(units)
+        frame = await async_read_frame(mock_hass_with_loop, reader, 1, 1)
 
-        frame = await session.async_wait_frame(timeout=1)
-
-        assert frame == f"frame{SNAPSHOT_SKIP_FRAMES}"
-        await session._async_close_media()
-
-    @pytest.mark.asyncio
-    async def test_short_stream_returns_last_frame(
-        self, mock_recording_coordinator
-    ) -> None:
-        """If the track ends before settling, the newest frame is used."""
-        from custom_components.tuya_peephole.snapshot import SnapshotSession
-
-        session = SnapshotSession(mock_recording_coordinator)
-        await session._async_on_video_track(_FakeTrack(["a", "b"]))
-
-        frame = await session.async_wait_frame(timeout=1)
-
-        assert frame == "b"
+        assert frame is not None
+        assert (frame.width, frame.height) == (160, 120)
+        # consumed exactly the frames it needed
+        assert len(reader._units) == FIXTURE_PICTURES - SNAPSHOT_SKIP_FRAMES - 1
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_newest_frame(
-        self, mock_recording_coordinator
-    ) -> None:
-        """On timeout, returns whatever frame arrived (stream still open)."""
-        from custom_components.tuya_peephole.snapshot import SnapshotSession
+    async def test_returns_newest_frame_on_timeout(self, mock_hass_with_loop) -> None:
+        """Fewer frames than the skip count: the newest one is used."""
+        from custom_components.tuya_peephole.snapshot import async_read_frame
 
-        session = SnapshotSession(mock_recording_coordinator)
-        await session._async_on_video_track(_HangingTrack(["only"]))
-
-        frame = await session.async_wait_frame(timeout=0.05)
-
-        assert frame == "only"
-        await session._async_close_media()
-        assert session._reader_task.done()
+        reader = _FakeReader(_depacketize(_packets())[:2])
+        frame = await async_read_frame(mock_hass_with_loop, reader, 1, 0.05)
+        assert frame is not None
 
     @pytest.mark.asyncio
-    async def test_no_frames_returns_none(self, mock_recording_coordinator) -> None:
-        """No frame at all -> None after the timeout."""
-        from custom_components.tuya_peephole.snapshot import SnapshotSession
+    async def test_no_video(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.snapshot import async_read_frame
 
-        session = SnapshotSession(mock_recording_coordinator)
-        await session._async_on_video_track(_HangingTrack([]))
-
-        frame = await session.async_wait_frame(timeout=0.05)
-
+        frame = await async_read_frame(mock_hass_with_loop, _FakeReader([]), 0.05, 1)
         assert frame is None
-        await session._async_close_media()
 
+    @pytest.mark.asyncio
+    async def test_stream_closed(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.snapshot import async_read_frame
 
-class TestFrameToJpeg:
-    """JPEG encoding of a decoded frame."""
-
-    def test_frame_to_jpeg_encodes_image(self) -> None:
-        """frame_to_jpeg returns JPEG bytes from frame.to_image()."""
-        PIL_Image = pytest.importorskip("PIL.Image")
-        from custom_components.tuya_peephole.snapshot import frame_to_jpeg
-
-        frame = MagicMock()
-        frame.to_image.return_value = PIL_Image.new("RGB", (32, 24), "red")
-
-        data = frame_to_jpeg(frame)
-
-        assert data[:2] == b"\xff\xd8"  # JPEG SOI marker
+        reader = _FakeReader([], end=True)
+        assert await async_read_frame(mock_hass_with_loop, reader, 1, 1) is None
 
 
 # ---------------------------------------------------------------------------
@@ -130,80 +93,55 @@ class TestFrameToJpeg:
 
 
 class TestAsyncCaptureSnapshot:
-    """End-to-end capture flow with the session mocked."""
-
-    def _patch_session(self, started=True, frame="frame"):
-        session = MagicMock()
-        session.async_start = AsyncMock(return_value=started)
-        session.async_wait_frame = AsyncMock(return_value=frame)
-        session.async_stop = AsyncMock()
-        return session, patch(
-            "custom_components.tuya_peephole.snapshot.SnapshotSession",
-            return_value=session,
-        )
+    """Capture flow with the live stream mocked."""
 
     @pytest.mark.asyncio
     async def test_capture_success(self, mock_recording_coordinator) -> None:
-        """Wakes with force, refreshes config, encodes the frame, stops session."""
+        """Reads the shared live stream, returns a JPEG, closes the reader."""
         from custom_components.tuya_peephole import snapshot
 
         coord = mock_recording_coordinator
-        frame = MagicMock(width=640, height=480)
-        session, patcher = self._patch_session(frame=frame)
+        reader = _FakeReader(_depacketize(_packets()))
+        coord.live_stream.open = MagicMock(return_value=reader)
 
-        with patcher, patch.object(
-            snapshot, "frame_to_jpeg", return_value=b"\xff\xd8jpeg"
-        ):
-            image = await snapshot.async_capture_snapshot(coord)
+        image = await snapshot.async_capture_snapshot(coord)
 
-        assert image == b"\xff\xd8jpeg"
-        coord.async_wake_camera.assert_awaited_once_with(force=True)
-        coord.api.invalidate_cache.assert_called_once()
-        session.async_stop.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_capture_session_fails_to_start(
-        self, mock_recording_coordinator
-    ) -> None:
-        """No stream -> None, session still stopped."""
-        from custom_components.tuya_peephole import snapshot
-
-        session, patcher = self._patch_session(started=False)
-        with patcher:
-            image = await snapshot.async_capture_snapshot(
-                mock_recording_coordinator
-            )
-
-        assert image is None
-        session.async_wait_frame.assert_not_awaited()
-        session.async_stop.assert_awaited_once()
+        assert image is not None and image.startswith(b"\xff\xd8")
+        assert reader.closed
 
     @pytest.mark.asyncio
     async def test_capture_no_frame(self, mock_recording_coordinator) -> None:
-        """Stream opens but no frame arrives -> None."""
+        """No video in time -> None, reader closed."""
         from custom_components.tuya_peephole import snapshot
 
-        session, patcher = self._patch_session(frame=None)
-        with patcher:
-            image = await snapshot.async_capture_snapshot(
-                mock_recording_coordinator
-            )
+        coord = mock_recording_coordinator
+        reader = _FakeReader([])
+        coord.live_stream.open = MagicMock(return_value=reader)
+        with patch.object(snapshot, "CONNECT_TIMEOUT", 0.05):
+            image = await snapshot.async_capture_snapshot(coord)
 
         assert image is None
-        session.async_stop.assert_awaited_once()
+        assert reader.closed
+
+    @pytest.mark.asyncio
+    async def test_capture_after_shutdown(self, mock_recording_coordinator) -> None:
+        from custom_components.tuya_peephole import snapshot
+
+        coord = mock_recording_coordinator
+        coord.live_stream.open = MagicMock(side_effect=StreamClosedError)
+        assert await snapshot.async_capture_snapshot(coord) is None
 
     @pytest.mark.asyncio
     async def test_capture_without_aiortc(self, mock_recording_coordinator) -> None:
-        """aiortc missing -> None without waking the camera."""
+        """aiortc missing -> None without opening the stream."""
         from custom_components.tuya_peephole import snapshot
 
+        coord = mock_recording_coordinator
         with patch.object(snapshot, "AIORTC_AVAILABLE", False):
-            image = await snapshot.async_capture_snapshot(
-                mock_recording_coordinator
-            )
+            image = await snapshot.async_capture_snapshot(coord)
 
         assert image is None
-        mock_recording_coordinator.async_wake_camera.assert_not_awaited()
+        coord.live_stream.open.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +392,6 @@ class TestSessionSignalingMsid:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from custom_components.tuya_peephole import webrtc_session
-        from custom_components.tuya_peephole.snapshot import SnapshotSession
 
         coord = mock_recording_coordinator
         coord.api.async_get_mqtt_config = AsyncMock(
@@ -465,10 +402,10 @@ class TestSessionSignalingMsid:
         pc = MagicMock()
         pc.createOffer = AsyncMock(return_value=MagicMock(sdp="v=0\r\n"))
         pc.setLocalDescription = AsyncMock()
+        pc.localDescription.sdp = "v=0\r\n"
         pc.close = AsyncMock()
 
-        session = SnapshotSession(coord)
-        session._setup_media = MagicMock()
+        session = webrtc_session.ServerWebRTCSession(coord)
         with (
             patch.object(webrtc_session, "AIORTC_AVAILABLE", True),
             patch.object(webrtc_session, "RTCPeerConnection", return_value=pc, create=True),

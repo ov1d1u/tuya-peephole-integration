@@ -1,17 +1,30 @@
 """Server-side aiortc WebRTC session to the camera.
 
-Creates an independent RTCPeerConnection inside Home Assistant (separate
-from the SDP proxy camera entity, which relays to the browser), negotiates
-SDP offer/answer via MQTT protocol 302, and hands the received video track
-to a subclass. Used by recording (MP4 muxing) and snapshots (one frame).
+Creates an RTCPeerConnection inside Home Assistant, negotiates it with the
+camera over MQTT protocol 302, and receives the camera's media through a
+WebRTC datachannel.
+
+Why the datachannel: on its regular media tracks the camera sends H.265
+labelled as H.264 and packed with H.264's RTP packetization, which no
+browser and no standard depacketizer can handle. When the offer sets
+``datachannel_enable`` and opens a channel named ``fmp4Stream``, the camera
+instead sends standard RTP packets (RFC 7798 H.265 video, PCMU audio) as
+binary datachannel messages after this handshake (the same one go2rtc's
+Tuya source uses):
+
+    client -> {"type": "codec", "msg": ""}
+    camera -> {"type": "codec", "msg": "hev1.1.6.L123.b0"}
+    client -> {"type": "start", "msg": "frame"}
+    camera -> {"type": "recv", "msg": "{\"video\":{\"ssrc\":0},\"audio\":{\"ssrc\":1}}"}
+    client -> {"type": "complete", "msg": ""}
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -48,282 +61,12 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 
-# The camera streams H.265/HEVC but announces it as H.264 (payload type 99)
-# and packs it with H.264's RTP packetization: HEVC NAL units go out whole
-# when small and as H.264 FU-A fragments when large. aiortc's H.264
-# depayloader rebuilds a valid HEVC Annex-B stream from that, except that it
-# rejects NAL units whose low five header bits are 0, 30 or 31 (unspecified
-# in H.264) -- which includes the HEVC VPS (header 40 01). Its H.264 decoder
-# then cannot decode HEVC. The two patches below cover both gaps.
-_UNSPECIFIED_NAL_TYPES = frozenset({0, 30, 31})
-_ANNEXB_START_CODES = (b"\x00\x00\x00\x01", b"\x00\x00\x01")
-_START_CODE = b"\x00\x00\x00\x01"
+DATACHANNEL_LABEL = "fmp4Stream"
+DATACHANNEL_MAX_RETRANSMITS = 5
 
-# HEVC VPS NAL header (type 32, layer 0, temporal id 1). Never valid H.264:
-# 0x40 is NAL type 0 there.
-_HEVC_VPS_MARKER = _START_CODE + b"\x40\x01"
-_HEVC_TYPE_VPS, _HEVC_TYPE_SPS, _HEVC_TYPE_PPS = 32, 33, 34
-_HEVC_TYPE_AUD, _HEVC_TYPE_PREFIX_SEI = 35, 39
-_HEVC_AU_START_TYPES = frozenset(
-    {
-        _HEVC_TYPE_VPS,
-        _HEVC_TYPE_SPS,
-        _HEVC_TYPE_PPS,
-        _HEVC_TYPE_AUD,
-        _HEVC_TYPE_PREFIX_SEI,
-    }
-)
-
-# Diagnostics: how many raw RTP payloads to log (debug level) for the
-# current session. Reset at each session start.
-_PAYLOAD_LOG_LIMIT = 12
-_payload_log_remaining = 0
-
-
-def patch_aiortc_h264_depayloader(h264_module: Any = None) -> bool:
-    """Make aiortc's H.264 depayloader keep the camera's HEVC NAL units.
-
-    aiortc raises "NAL unit type 0 is not supported" for the HEVC VPS and
-    drops the packet. That loses the VPS (so nothing can be decoded) and
-    leaves a hole in the jitter buffer, which only emits frames from a
-    contiguous run of packets, so no frame comes out at all.
-
-    The patched parser strips an Annex-B start code if a payload carries one
-    and passes unspecified NAL types through as single NAL units. Everything
-    else goes to aiortc unchanged. Returns True once the patch is in place.
-    """
-    if h264_module is None:
-        try:
-            from aiortc.codecs import h264 as h264_module
-        except ImportError:
-            return False
-
-    descriptor_cls = h264_module.H264PayloadDescriptor
-    if getattr(descriptor_cls.parse, "_tuya_patched", False):
-        return True
-    original_parse = descriptor_cls.parse.__func__
-
-    def parse(cls, data: bytes):  # type: ignore[no-untyped-def]
-        global _payload_log_remaining
-        if _payload_log_remaining > 0 and _LOGGER.isEnabledFor(logging.DEBUG):
-            _payload_log_remaining -= 1
-            shown = data if len(data) <= 64 else data[:24]
-            _LOGGER.debug(
-                "RTP video payload len=%d: %s%s",
-                len(data),
-                shown.hex(" "),
-                "" if shown is data else " ...",
-            )
-        for start_code in _ANNEXB_START_CODES:
-            if data.startswith(start_code) and len(data) > len(start_code):
-                data = data[len(start_code):]
-                break
-        if len(data) >= 2 and (data[0] & 0x1F) in _UNSPECIFIED_NAL_TYPES:
-            return cls(first_fragment=True), _START_CODE + data
-        return original_parse(cls, data)
-
-    parse._tuya_patched = True  # type: ignore[attr-defined]
-    descriptor_cls.parse = classmethod(parse)
-    return True
-
-
-def split_annexb(data: bytes) -> list[bytes]:
-    """Split an Annex-B byte stream into NAL units (without start codes)."""
-    nals: list[bytes] = []
-    i, n = 0, len(data)
-    start = -1
-    while i + 3 <= n:
-        if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
-            if start >= 0:
-                end = i - 1 if i > 0 and data[i - 1] == 0 else i
-                if end > start:
-                    nals.append(data[start:end])
-            i += 3
-            start = i
-        else:
-            i += 1
-    if 0 <= start < n:
-        nals.append(data[start:])
-    return nals
-
-
-def split_hevc_access_units(data: bytes) -> list[bytes]:
-    """Split HEVC Annex-B data into access units (one picture each).
-
-    The camera's first burst carries a keyframe plus several P-frames under
-    one RTP timestamp, so aiortc hands them over as a single "frame". A new
-    access unit starts at a parameter set, AUD or prefix SEI, or at a slice
-    with first_slice_segment_in_pic_flag set, once the current one already
-    holds a picture.
-    """
-    units: list[bytes] = []
-    current: list[bytes] = []
-    has_picture = False
-    for nal in split_annexb(data):
-        if len(nal) < 2:
-            continue
-        nal_type = (nal[0] >> 1) & 0x3F
-        is_slice = nal_type < 32
-        first_slice = is_slice and len(nal) > 2 and bool(nal[2] & 0x80)
-        if has_picture and (
-            nal_type in _HEVC_AU_START_TYPES or first_slice
-        ):
-            units.append(b"".join(_START_CODE + x for x in current))
-            current, has_picture = [], False
-        current.append(nal)
-        has_picture = has_picture or is_slice
-    if current:
-        units.append(b"".join(_START_CODE + x for x in current))
-    return units
-
-
-def patch_aiortc_h264_decoder(h264_module: Any = None) -> bool:
-    """Let aiortc's H.264 decoder decode the camera's HEVC stream.
-
-    The first time a frame contains an HEVC VPS, the decoder's codec context
-    is replaced with an HEVC one, and from then on each frame is split into
-    access units that are decoded one by one. Real H.264 never contains the
-    VPS marker, so H.264 streams are decoded exactly as before. Returns True
-    once the patch is in place.
-    """
-    if h264_module is None:
-        try:
-            from aiortc.codecs import h264 as h264_module
-        except ImportError:
-            return False
-
-    decoder_cls = h264_module.H264Decoder
-    if getattr(decoder_cls.decode, "_tuya_patched", False):
-        return True
-    original_decode = decoder_cls.decode
-    av_module = h264_module.av
-
-    def decode(self, encoded_frame):  # type: ignore[no-untyped-def]
-        if not getattr(self, "_tuya_hevc", False):
-            if _HEVC_VPS_MARKER not in encoded_frame.data:
-                return original_decode(self, encoded_frame)
-            _LOGGER.debug("Camera stream is HEVC; switching decoder to hevc")
-            self.codec = av_module.CodecContext.create("hevc", "r")
-            self._tuya_hevc = True
-
-        frames: list[Any] = []
-        error: Exception | None = None
-        for unit in split_hevc_access_units(encoded_frame.data):
-            packet = av_module.Packet(unit)
-            packet.pts = encoded_frame.timestamp
-            packet.time_base = h264_module.VIDEO_TIME_BASE
-            try:
-                frames.extend(self.codec.decode(packet))
-            except av_module.FFmpegError as exc:
-                error = exc
-        if not frames and error is not None:
-            raise error
-        return frames
-
-    decode._tuya_patched = True  # type: ignore[attr-defined]
-    decoder_cls.decode = decode
-    return True
-
-
-# A packet the camera never resends stalls aiortc's video jitter buffer: it
-# only releases frames from a gap-free run of packets and gives up on a gap
-# only once 512 packets have piled up behind it. The camera sends ~50
-# packets/s, so that takes ~10 s, which eats most of the snapshot timeout
-# before the keyframe request (PLI) even goes out.
-JITTER_HOLE_TIMEOUT = 1.0  # seconds a gap may stall the buffer
-
-
-def make_hole_skipping_jitter_buffer(
-    jitterbuffer_module: Any = None,
-    clock: Callable[[], float] = time.monotonic,
-) -> Any:
-    """Return a JitterBuffer subclass that skips a gap after a short wait.
-
-    When packets keep arriving behind a missing one for longer than
-    JITTER_HOLE_TIMEOUT, the frame with the gap is dropped (it cannot be
-    decoded anyway), a PLI is requested so the camera sends a fresh
-    keyframe, and frames flow again. Returns None without aiortc.
-    """
-    if jitterbuffer_module is None:
-        try:
-            from aiortc import jitterbuffer as jitterbuffer_module
-        except ImportError:
-            return None
-    base = jitterbuffer_module.JitterBuffer
-    uint16_add = jitterbuffer_module.uint16_add
-
-    class HoleSkippingJitterBuffer(base):  # type: ignore[misc, valid-type]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self._tuya_hole_since: float | None = None
-            self._tuya_newest: int | None = None
-
-        def _tuya_run_length(self) -> int:
-            """Number of consecutive packets present from the origin."""
-            for count in range(self._capacity):
-                if self._packets[(self._origin + count) % self._capacity] is None:
-                    return count
-            return self._capacity
-
-        def add(self, packet: Any) -> tuple[bool, Any]:
-            seq = packet.sequence_number
-            if self._tuya_newest is None or 0 < uint16_add(
-                seq, -self._tuya_newest
-            ) < 0x8000:
-                self._tuya_newest = seq
-
-            pli_flag, frame = super().add(packet)
-            if frame is not None or self._origin is None:
-                self._tuya_hole_since = None
-                return pli_flag, frame
-
-            run = self._tuya_run_length()
-            newest = uint16_add(self._tuya_newest, -self._origin)
-            if newest >= self._capacity:
-                self._tuya_newest = seq  # buffer was reset under us
-                newest = uint16_add(seq, -self._origin)
-            if newest < run:
-                # No gap behind the newest packet: the current frame is
-                # just still incomplete.
-                self._tuya_hole_since = None
-                return pli_flag, frame
-
-            now = clock()
-            if self._tuya_hole_since is None:
-                self._tuya_hole_since = now
-                return pli_flag, frame
-            if now - self._tuya_hole_since < JITTER_HOLE_TIMEOUT:
-                return pli_flag, frame
-
-            _LOGGER.debug(
-                "RTP packet %d never arrived; skipping the broken frame",
-                uint16_add(self._origin, run),
-            )
-            self._tuya_hole_since = None
-            if self.smart_remove(run + 1):
-                self._origin = None  # everything dropped; reseed on next add
-                return True, None
-            return True, self._remove_frame(seq)
-
-    return HoleSkippingJitterBuffer
-
-
-def install_hole_skipping_jitter_buffer(receiver: Any) -> bool:
-    """Swap a fresh video RTCRtpReceiver's jitter buffer for one that skips
-    lost packets quickly. Must run before any packet is received."""
-    buffer_cls = make_hole_skipping_jitter_buffer()
-    attr = "_RTCRtpReceiver__jitter_buffer"
-    current = getattr(receiver, attr, None)
-    if buffer_cls is None or current is None or not current._is_video:
-        _LOGGER.debug("Cannot install hole-skipping jitter buffer")
-        return False
-    setattr(receiver, attr, buffer_cls(capacity=current.capacity, is_video=True))
-    return True
-
-
-if AIORTC_AVAILABLE:
-    patch_aiortc_h264_depayloader()
-    patch_aiortc_h264_decoder()
+# close_reason the camera sends when a new session arrives too soon after
+# the previous one ended; it accepts calls again after ~30-40 s.
+CLOSE_REASON_BUSY = 93
 
 # What aiortc's parser accepts (aiortc.rtcicetransport STUN/TURN_REGEX):
 # no IPv6 brackets, optional port, optional ?transport=.
@@ -382,29 +125,42 @@ def build_aiortc_ice_servers(p2p_ices: list[dict[str, Any]]) -> list[Any]:
 
 
 class ServerWebRTCSession:
-    """Base class for a server-side WebRTC session receiving camera video.
+    """A WebRTC session receiving the camera's media over a datachannel.
 
-    Subclasses override the media hooks:
-    - _setup_media(): called once the PeerConnection exists
-    - _async_on_video_track(track): called when the camera's video arrives
-    - _async_close_media(): called first during async_stop()
+    on_packet(data, video) is called with each raw RTP packet (bytes) and
+    whether it belongs to the video stream. on_closed() is called once when
+    the session ends for any reason other than async_stop().
     """
 
     _label = "WebRTC"
 
-    def __init__(self, coordinator: TuyaPeepholeCoordinator) -> None:
+    def __init__(
+        self,
+        coordinator: TuyaPeepholeCoordinator,
+        on_packet: Callable[[bytes, bool], None] | None = None,
+        on_closed: Callable[[], None] | None = None,
+    ) -> None:
         """Initialize the session.
 
         Args:
             coordinator: The Tuya Peephole coordinator instance.
+            on_packet: Receives each RTP packet and whether it is video.
+            on_closed: Called when the camera or the connection ends it.
         """
         self._coordinator = coordinator
+        self._on_packet = on_packet
+        self._on_closed = on_closed
         self._pc: Any = None  # RTCPeerConnection (typed as Any for optional dep)
+        self._channel: Any = None  # RTCDataChannel
         self._session_id: str | None = None
         self._answer_event = asyncio.Event()
         self._answer_sdp: str | None = None
         self._started = False
         self._stopped = False
+        self._video_ssrc: int | None = None
+        self._audio_ssrc: int | None = None
+        # close_reason from the camera's disconnect message, if any
+        self.close_reason: int | None = None
 
         # MQTT signaling state
         self._subscribe_topic: str | None = None
@@ -413,23 +169,19 @@ class ServerWebRTCSession:
         self._uid: str | None = None
         self._moto_id: str | None = None
 
-    # --- Media hooks (override in subclasses) ---
-
-    def _setup_media(self) -> None:
-        """Prepare media sinks after the PeerConnection is created."""
-
-    async def _async_on_video_track(self, track: Any) -> None:
-        """Handle the camera's video track."""
-
-    async def _async_close_media(self) -> None:
-        """Release media sinks during stop."""
+    @property
+    def stopped(self) -> bool:
+        """Return True once the session has ended."""
+        return self._stopped
 
     # --- Session lifecycle ---
 
     async def async_start(self) -> bool:
-        """Create PeerConnection, negotiate SDP with the camera, start media.
+        """Create the PeerConnection and negotiate it with the camera.
 
-        Returns True if the session started successfully, False on any error.
+        Returns True once the camera's SDP answer is applied. Media starts
+        flowing to on_packet after the datachannel handshake. Returns False
+        on any error (the session is then stopped).
         """
         if not AIORTC_AVAILABLE:
             _LOGGER.error(
@@ -437,9 +189,6 @@ class ServerWebRTCSession:
                 self._label,
             )
             return False
-
-        global _payload_log_remaining
-        _payload_log_remaining = _PAYLOAD_LOG_LIMIT
 
         try:
             # Step 1: Fetch WebRTC config from Tuya API
@@ -466,55 +215,36 @@ class ServerWebRTCSession:
             self._uid = uid
             self._moto_id = moto_id
 
-            # Step 3: Build ICE server configuration
+            # Step 3: PeerConnection. Audio goes before video in the offer,
+            # otherwise the camera sends a corrupt SDP answer.
             config = RTCConfiguration(
                 iceServers=build_aiortc_ice_servers(p2p_ices)
             )
-
-            # Step 4: Create PeerConnection and media sinks
             self._pc = RTCPeerConnection(configuration=config)
-            self._setup_media()
+            self._pc.addTransceiver("audio", direction="recvonly")
+            self._pc.addTransceiver("video", direction="recvonly")
+            self._setup_datachannel()
 
-            # Step 5: Add recvonly video transceiver
-            transceiver = self._pc.addTransceiver(
-                "video", direction="recvonly"
-            )
-            install_hole_skipping_jitter_buffer(transceiver.receiver)
-
-            # Step 6: Register track handler
-            @self._pc.on("track")
-            async def on_track(track: Any) -> None:
-                if track.kind == "video":
-                    _LOGGER.debug(
-                        "%s session received video track", self._label
-                    )
-                    await self._async_on_video_track(track)
-
-            # Step 7: Register connection state change handler
             @self._pc.on("connectionstatechange")
             async def on_state_change() -> None:
                 state = self._pc.connectionState
                 _LOGGER.debug(
                     "%s PeerConnection state: %s", self._label, state
                 )
-                if state == "failed":
-                    _LOGGER.warning(
-                        "%s PeerConnection failed, stopping session",
-                        self._label,
-                    )
-                    await self.async_stop()
+                if state in ("failed", "closed"):
+                    await self._async_closed_remotely(f"connection {state}")
 
-            # Step 8: Create SDP offer
+            # Step 4: Create SDP offer
             offer = await self._pc.createOffer()
             await self._pc.setLocalDescription(offer)
 
-            # Step 9: Generate signaling session ID
+            # Step 5: Generate signaling session ID
             self._session_id = generate_session_id()
             _LOGGER.debug(
                 "%s signaling session: %s", self._label, self._session_id
             )
 
-            # Step 10: Subscribe to answer topic via MQTT
+            # Step 6: Subscribe to answer topic via MQTT
             mqtt_client = self._coordinator.mqtt_client
             if mqtt_client is None or not mqtt_client.is_connected:
                 _LOGGER.error(
@@ -544,13 +274,14 @@ class ServerWebRTCSession:
             )
             mqtt_client.subscribe(self._subscribe_topic, qos=1)
 
-            # Step 11: Build and publish offer
-            cleaned_sdp = strip_sdp_extmap(offer.sdp)
+            # Step 7: Build and publish offer
+            cleaned_sdp = strip_sdp_extmap(self._pc.localDescription.sdp)
             offer_payload = build_offer_payload(
                 sdp=cleaned_sdp,
                 auth=auth,
                 ice_servers=p2p_ices,
                 stream_type=WEBRTC_STREAM_TYPE_HD,
+                datachannel_enable=True,
             )
             offer_message = build_protocol_302_message(
                 msg_type="offer",
@@ -567,7 +298,7 @@ class ServerWebRTCSession:
                 "%s offer published to %s", self._label, self._publish_topic
             )
 
-            # Step 12: Wait for SDP answer
+            # Step 8: Wait for SDP answer (or an early disconnect)
             try:
                 await asyncio.wait_for(
                     self._answer_event.wait(),
@@ -581,13 +312,15 @@ class ServerWebRTCSession:
                 )
                 return False
 
-            # Step 13: Set remote description from received answer
             if self._answer_sdp is None:
-                _LOGGER.error(
-                    "%s answer SDP is None after event", self._label
+                _LOGGER.debug(
+                    "%s: camera hung up before answering (close_reason=%s)",
+                    self._label,
+                    self.close_reason,
                 )
                 return False
 
+            # Step 9: Set remote description from received answer
             await self._pc.setRemoteDescription(
                 RTCSessionDescription(
                     sdp=self._answer_sdp, type="answer"
@@ -605,8 +338,75 @@ class ServerWebRTCSession:
             if not self._started:
                 await self.async_stop()
 
+    def _setup_datachannel(self) -> None:
+        """Open the camera's media datachannel and run its handshake."""
+        channel = self._pc.createDataChannel(
+            DATACHANNEL_LABEL,
+            ordered=True,
+            maxRetransmits=DATACHANNEL_MAX_RETRANSMITS,
+        )
+        self._channel = channel
+
+        @channel.on("open")
+        def on_open() -> None:
+            _LOGGER.debug("%s datachannel open", self._label)
+            self._send_control("codec")
+
+        @channel.on("message")
+        def on_message(message: bytes | str) -> None:
+            if isinstance(message, str):
+                self._on_control_message(message)
+            else:
+                self._on_media_message(message)
+
+        @channel.on("close")
+        def on_close() -> None:
+            if not self._stopped:
+                asyncio.get_running_loop().create_task(
+                    self._async_closed_remotely("datachannel closed")
+                )
+
+    def _send_control(self, msg_type: str, msg: str = "") -> None:
+        if self._channel is not None and self._channel.readyState == "open":
+            self._channel.send(json.dumps({"type": msg_type, "msg": msg}))
+
+    def _on_control_message(self, text: str) -> None:
+        """Handle a JSON control message from the camera's datachannel."""
+        try:
+            message = json.loads(text)
+        except ValueError:
+            _LOGGER.debug("%s: bad datachannel message: %s", self._label, text)
+            return
+        msg_type = message.get("type")
+        _LOGGER.debug("%s datachannel %s: %s", self._label, msg_type, message.get("msg"))
+        if msg_type == "codec":
+            self._send_control("start", "frame")
+        elif msg_type == "recv":
+            try:
+                streams = json.loads(message.get("msg") or "{}")
+                self._video_ssrc = streams["video"]["ssrc"]
+                self._audio_ssrc = streams.get("audio", {}).get("ssrc")
+            except (ValueError, KeyError, TypeError):
+                _LOGGER.warning(
+                    "%s: unexpected stream description: %s",
+                    self._label,
+                    message.get("msg"),
+                )
+                return
+            self._send_control("complete")
+
+    def _on_media_message(self, data: bytes) -> None:
+        """Route one RTP packet from the datachannel by its SSRC."""
+        if self._on_packet is None or self._video_ssrc is None or len(data) < 12:
+            return
+        ssrc = int.from_bytes(data[8:12], "big")
+        if ssrc == self._video_ssrc:
+            self._on_packet(data, True)
+        elif ssrc == self._audio_ssrc:
+            self._on_packet(data, False)
+
     def _on_signaling_message(self, payload: bytes) -> None:
-        """Handle incoming MQTT protocol 302 message (answer or candidate).
+        """Handle incoming MQTT protocol 302 message for this session.
 
         Args:
             payload: Raw MQTT payload bytes.
@@ -630,26 +430,38 @@ class ServerWebRTCSession:
             self._answer_event.set()
 
         elif msg_type == "candidate":
-            # aiortc handles ICE gathering internally -- log and skip
-            raw_candidate = msg_data.get("candidate", "")
+            # aiortc handles ICE gathering internally (the camera's TURN
+            # relay candidates arrive in the SDP answer)
+            pass
+
+        elif msg_type == "disconnect":
+            self.close_reason = msg_data.get("close_reason")
             _LOGGER.debug(
-                "%s received ICE candidate (ignored, aiortc gathers internally): %s",
+                "%s: camera disconnected (close_reason=%s)",
                 self._label,
-                raw_candidate[:60] if raw_candidate else "",
+                self.close_reason,
             )
+            # Unblock async_start if it is still waiting for the answer
+            self._answer_event.set()
+            if self._started:
+                asyncio.get_running_loop().create_task(
+                    self._async_closed_remotely("camera disconnected")
+                )
+
+    async def _async_closed_remotely(self, reason: str) -> None:
+        """End the session because the camera or the network ended it."""
+        if self._stopped or not self._started:
+            return
+        _LOGGER.debug("%s session ended: %s", self._label, reason)
+        await self.async_stop()
+        if self._on_closed is not None:
+            self._on_closed()
 
     async def async_stop(self) -> None:
         """Stop the session and clean up resources."""
         if self._stopped:
             return
         self._stopped = True
-
-        try:
-            await self._async_close_media()
-        except Exception:
-            _LOGGER.debug(
-                "Error closing %s media", self._label, exc_info=True
-            )
 
         # Send disconnect via MQTT protocol 302
         mqtt_client = self._coordinator.mqtt_client
@@ -658,24 +470,15 @@ class ServerWebRTCSession:
             and mqtt_client.is_connected
             and self._publish_topic
             and self._session_id
+            and self._moto_id
         ):
             try:
-                uid = self._uid or self._coordinator.msid
-                moto_id = self._moto_id
-                if moto_id is None:
-                    webrtc_config = (
-                        await self._coordinator.api.async_get_webrtc_config(
-                            self._coordinator.device_id
-                        )
-                    )
-                    moto_id = webrtc_config["motoId"]
-
                 message = build_protocol_302_message(
                     msg_type="disconnect",
-                    uid=uid,
+                    uid=self._uid or self._coordinator.msid,
                     device_id=self._coordinator.device_id,
                     session_id=self._session_id,
-                    moto_id=moto_id,
+                    moto_id=self._moto_id,
                     msg_payload=build_disconnect_payload(),
                 )
                 mqtt_client.publish(self._publish_topic, message, qos=0)

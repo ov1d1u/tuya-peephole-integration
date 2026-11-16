@@ -145,6 +145,27 @@ class TuyaMQTTMessage:
         return data.get("online") is False
 
     @property
+    def is_link_change(self) -> bool:
+        """Check if the camera's cloud link just went down or came back up.
+
+        Going to sleep, the camera reports DPS 149 = false, then "online":
+        false and "online": true as it moves to its low-power link. Waking,
+        it reports "online": true, then DPS 149 = true. The DPS 149 = false
+        and "online": false messages are sometimes never delivered, leaving
+        only the final "online" update. Since a link change happens both
+        when falling asleep and just before reporting awake, the camera
+        cannot be assumed awake until DPS 149 = true follows.
+        """
+        if self._json is None or self._json.get("protocol") != 1:
+            return False
+        data = self._json.get("data")
+        return (
+            isinstance(data, dict)
+            and "online" in data
+            and "lastOnlineChangeTime" in data
+        )
+
+    @property
     def is_motion(self) -> bool:
         """Check if this message indicates a motion/PIR event.
 

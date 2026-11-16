@@ -11,7 +11,11 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlowWithConfigEntry
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    OptionsFlowWithConfigEntry,
+)
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
@@ -19,10 +23,14 @@ from .api import TuyaSmartAPI
 from .const import (
     CONF_DEVICE_ID,
     CONF_EMAIL,
+    CONF_LIVE_CODEC,
     CONF_LOCAL_KEY,
     CONF_PASSWORD,
     CONF_REGION,
+    DEFAULT_LIVE_CODEC,
     DOMAIN,
+    LIVE_CODEC_H264,
+    LIVE_CODEC_HEVC,
     REGION_NAMES,
     REGIONS,
 )
@@ -285,6 +293,9 @@ class TuyaPeepholeOptionsFlow(OptionsFlowWithConfigEntry):
                         vol.Required(
                             "recording_duration", default=60
                         ): vol.All(int, vol.Range(min=10, max=300)),
+                        vol.Required(
+                            CONF_LIVE_CODEC, default=DEFAULT_LIVE_CODEC
+                        ): vol.In([LIVE_CODEC_H264, LIVE_CODEC_HEVC]),
                     }
                 ),
                 self.options,

@@ -1,7 +1,7 @@
 """Tests for tuya_peephole recorder.py (RecordingSession, RecordingManager).
 
 Tests the recording engine: session lifecycle (start/stop), disk space
-checks, camera wake requirement, retention cleanup, motion callback
+checks, retention cleanup, motion callback
 triggers, charging detection state machine, and continuous mode task
 lifecycle.
 
@@ -25,117 +25,74 @@ import pytest
 
 
 class TestRecordingSession:
-    """Test RecordingSession WebRTC session lifecycle."""
+    """RecordingSession writes the shared live stream to MP4."""
 
-    @pytest.mark.asyncio
-    async def test_recording_session_start_success(
-        self, mock_recording_coordinator
-    ) -> None:
-        """[REC-01] Session creates PeerConnection, sends offer via MQTT, receives answer."""
-        from custom_components.tuya_peephole.recorder import RecordingSession
-
-        coord = mock_recording_coordinator
-        session = RecordingSession(coord, "/tmp/test_recording.mp4.tmp")
-
-        # Simulate answer arriving after offer is published
-        original_wait_for = asyncio.wait_for
-
-        async def fake_wait_for(coro, timeout):
-            # Set answer before the event wait completes
-            session._answer_sdp = "v=0\r\nmock answer sdp"
-            session._answer_event.set()
-            return await original_wait_for(coro, timeout)
-
-        with patch("asyncio.wait_for", side_effect=fake_wait_for):
-            result = await session.async_start()
-
-        assert result is True
-        assert session._started is True
-
-        # Verify MQTT publish was called (offer sent)
-        coord.mqtt_client.publish.assert_called()
-        # Verify WebRTC config was fetched
-        coord.api.async_get_webrtc_config.assert_awaited()
-        # Signals with the connection's msid, never a freshly minted one
-        coord.api.async_get_mqtt_config.assert_not_called()
-        coord.mqtt_client.subscribe.assert_any_call(
-            "/av/u/test_msid_789", qos=1
+    def _coord(self, coord, reader):
+        coord.hass.async_add_executor_job = AsyncMock(
+            side_effect=lambda fn, *args: fn(*args)
         )
+        coord.live_stream = MagicMock()
+        coord.live_stream.open = MagicMock(return_value=reader)
+        return coord
 
     @pytest.mark.asyncio
-    async def test_recording_session_start_failure_no_mqtt(
-        self, mock_recording_coordinator
-    ) -> None:
-        """Session returns False when MQTT client is None."""
+    async def test_records_h264_mp4(self, mock_recording_coordinator, tmp_path) -> None:
+        """[REC-01] Starts once video flows; stop finalizes a playable MP4."""
+        import av
+
         from custom_components.tuya_peephole.recorder import RecordingSession
 
-        coord = mock_recording_coordinator
-        coord.mqtt_client = None
-        session = RecordingSession(coord, "/tmp/test_recording.mp4.tmp")
+        from .test_hevc_stream import FIXTURE_PICTURES, _depacketize, _packets
+        from .test_snapshot import _FakeReader
 
-        result = await session.async_start()
-        assert result is False
+        reader = _FakeReader(_depacketize(_packets()))
+        coord = self._coord(mock_recording_coordinator, reader)
+        path = tmp_path / "clip.mp4.tmp"
+        session = RecordingSession(coord, str(path))
 
-    @pytest.mark.asyncio
-    async def test_recording_session_start_failure_mqtt_disconnected(
-        self, mock_recording_coordinator
-    ) -> None:
-        """Session returns False when MQTT is disconnected."""
-        from custom_components.tuya_peephole.recorder import RecordingSession
-
-        coord = mock_recording_coordinator
-        coord.mqtt_client.is_connected = False
-        session = RecordingSession(coord, "/tmp/test_recording.mp4.tmp")
-
-        result = await session.async_start()
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_recording_session_stop_cleanup(
-        self, mock_recording_coordinator
-    ) -> None:
-        """[REC-01] After start, stop cleans up recorder, PC, and MQTT."""
-        from custom_components.tuya_peephole.recorder import RecordingSession
-
-        coord = mock_recording_coordinator
-        session = RecordingSession(coord, "/tmp/test_recording.mp4.tmp")
-
-        # Simulate a started session by setting internal state
-        session._started = True
-        session._session_id = "abc123"
-        session._subscribe_topic = "/av/u/test_msid_789"
-        session._publish_topic = "/av/moto/test_moto_123/u/test_device_id_abc123"
-
-        mock_recorder = MagicMock()
-        mock_recorder.stop = AsyncMock()
-        session._recorder = mock_recorder
-
-        mock_pc = MagicMock()
-        mock_pc.close = AsyncMock()
-        session._pc = mock_pc
-
+        assert await session.async_start() is True
+        await asyncio.sleep(0.05)  # let the writer drain the queue
         await session.async_stop()
 
-        assert session._stopped is True
-        mock_recorder.stop.assert_awaited_once()
-        mock_pc.close.assert_awaited_once()
-        # MQTT callback should have been removed via public method
-        coord.mqtt_client.message_callback_remove.assert_called_with(
-            "/av/u/test_msid_789", session._signaling_cb
-        )
+        assert reader.closed
+        with av.open(str(path), format="mp4") as container:
+            stream = container.streams.video[0]
+            assert stream.codec_context.name == "h264"
+            assert len(list(container.decode(stream))) == FIXTURE_PICTURES
 
     @pytest.mark.asyncio
-    async def test_recording_session_stop_idempotent(
-        self, mock_recording_coordinator
-    ) -> None:
-        """Calling stop twice does not error (idempotent)."""
+    async def test_no_video_fails_start(self, mock_recording_coordinator, tmp_path) -> None:
+        """No keyframe in time -> False, reader closed, no file."""
+        from custom_components.tuya_peephole import recorder
+
+        from .test_snapshot import _FakeReader
+
+        reader = _FakeReader([])
+        coord = self._coord(mock_recording_coordinator, reader)
+        path = tmp_path / "clip.mp4.tmp"
+        session = recorder.RecordingSession(coord, str(path))
+        with patch.object(recorder, "RECORDING_START_TIMEOUT", 0.05):
+            assert await session.async_start() is False
+        assert reader.closed
+        assert not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_stream_shut_down(self, mock_recording_coordinator, tmp_path) -> None:
+        """The live stream shutting down before video -> False."""
+        from custom_components.tuya_peephole.live_stream import StreamClosedError
         from custom_components.tuya_peephole.recorder import RecordingSession
 
-        coord = mock_recording_coordinator
-        session = RecordingSession(coord, "/tmp/test_recording.mp4.tmp")
-        session._stopped = True
+        coord = self._coord(mock_recording_coordinator, None)
+        coord.live_stream.open.side_effect = StreamClosedError
+        session = RecordingSession(coord, str(tmp_path / "x.mp4.tmp"))
+        assert await session.async_start() is False
 
-        # Should return immediately without error
+    @pytest.mark.asyncio
+    async def test_stop_is_idempotent(self, mock_recording_coordinator, tmp_path) -> None:
+        from custom_components.tuya_peephole.recorder import RecordingSession
+
+        session = RecordingSession(mock_recording_coordinator, str(tmp_path / "x"))
+        await session.async_stop()
         await session.async_stop()
 
 
@@ -236,16 +193,13 @@ class TestRecordingManager:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_start_recording_camera_wakes(
+    async def test_start_recording_session_fails(
         self, mock_recording_coordinator, tmp_path
     ) -> None:
-        """[REC-01] Camera is woken up before recording if sleeping."""
-        from custom_components.tuya_peephole.models import CameraState
+        """No video from the camera -> no active recording."""
         from custom_components.tuya_peephole.recorder import RecordingManager
 
         coord = mock_recording_coordinator
-        coord.camera_state = CameraState.SLEEPING
-        coord.async_wake_camera = AsyncMock(return_value=True)
         hass = coord.hass
 
         manager = RecordingManager(hass, coord)
@@ -257,47 +211,13 @@ class TestRecordingManager:
         hass.async_add_executor_job = AsyncMock(
             side_effect=lambda fn, *args: fn(*args) if args else fn()
         )
-        with patch("shutil.disk_usage", return_value=mock_usage):
-            with patch(
+        with (
+            patch("shutil.disk_usage", return_value=mock_usage),
+            patch(
                 "custom_components.tuya_peephole.recorder.RecordingSession"
-            ) as MockSession:
-                mock_session_instance = MagicMock()
-                mock_session_instance.async_start = AsyncMock(return_value=True)
-                mock_session_instance._output_path = str(tmp_path / "test.mp4.tmp")
-                MockSession.return_value = mock_session_instance
-
-                with patch(
-                    "custom_components.tuya_peephole.recorder.async_call_later",
-                    return_value=MagicMock(),
-                ):
-                    result = await manager.async_start_recording()
-
-        assert result is True
-        coord.async_wake_camera.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_start_recording_wake_fails(
-        self, mock_recording_coordinator, tmp_path
-    ) -> None:
-        """Recording fails when camera cannot be woken."""
-        from custom_components.tuya_peephole.models import CameraState
-        from custom_components.tuya_peephole.recorder import RecordingManager
-
-        coord = mock_recording_coordinator
-        coord.camera_state = CameraState.SLEEPING
-        coord.async_wake_camera = AsyncMock(return_value=False)
-        hass = coord.hass
-
-        manager = RecordingManager(hass, coord)
-        manager._storage_path = tmp_path / "media"
-        manager._storage_path.mkdir(parents=True, exist_ok=True)
-
-        mock_usage = MagicMock()
-        mock_usage.free = 1024 * 1024 * 1024
-        hass.async_add_executor_job = AsyncMock(
-            side_effect=lambda fn, *args: fn(*args) if args else fn()
-        )
-        with patch("shutil.disk_usage", return_value=mock_usage):
+            ) as MockSession,
+        ):
+            MockSession.return_value.async_start = AsyncMock(return_value=False)
             result = await manager.async_start_recording()
 
         assert result is False

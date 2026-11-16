@@ -1,9 +1,7 @@
-"""Server-side WebRTC recording via aiortc.
+"""Recordings of the camera's live stream to MP4.
 
-Creates an independent RTCPeerConnection to the camera (separate from
-the SDP proxy camera entity), receives H.264 video, and muxes to MP4
-via aiortc's MediaRecorder. Uses existing MQTT protocol 302 signaling
-(see webrtc_session.ServerWebRTCSession).
+Reads the shared LiveStream (see live_stream.py) and writes it to an MP4
+file, transcoded to H.264 so recordings play in every browser.
 """
 
 from __future__ import annotations
@@ -28,27 +26,24 @@ from .const import (
     RECORDING_STORAGE_SUBDIR,
     RECORDING_WATCHDOG_MULTIPLIER,
     RETENTION_DAYS,
+    WAKE_TIMEOUT,
+    WEBRTC_SESSION_TIMEOUT,
 )
-from .models import CameraState
-from .webrtc_session import AIORTC_AVAILABLE, ServerWebRTCSession
+from .live_stream import StreamClosedError, StreamReader
+from .media import StreamMuxer
+from .webrtc_session import AIORTC_AVAILABLE
 
 if TYPE_CHECKING:
     from .coordinator import TuyaPeepholeCoordinator
 
-if AIORTC_AVAILABLE:
-    from aiortc.contrib.media import MediaRecorder
-
 _LOGGER = logging.getLogger(__name__)
 
+# Waking and connecting the camera before the first keyframe arrives
+RECORDING_START_TIMEOUT = WAKE_TIMEOUT + WEBRTC_SESSION_TIMEOUT
 
-class RecordingSession(ServerWebRTCSession):
-    """Server-side aiortc WebRTC session for recording camera video to MP4.
 
-    Negotiates the stream via ServerWebRTCSession and muxes the received
-    H.264 video to an MP4 file via aiortc's MediaRecorder.
-    """
-
-    _label = "Recording"
+class RecordingSession:
+    """Write the live stream to one MP4 file until stopped."""
 
     def __init__(
         self, coordinator: TuyaPeepholeCoordinator, output_path: str
@@ -59,23 +54,72 @@ class RecordingSession(ServerWebRTCSession):
             coordinator: The Tuya Peephole coordinator instance.
             output_path: File path for the MP4 output (typically .tmp suffix).
         """
-        super().__init__(coordinator)
+        self._coordinator = coordinator
         self._output_path = output_path
-        self._recorder: Any = None  # MediaRecorder
+        self._reader: StreamReader | None = None
+        self._muxer: StreamMuxer | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._started = asyncio.Event()
 
-    def _setup_media(self) -> None:
-        """Create the MP4 MediaRecorder."""
-        self._recorder = MediaRecorder(self._output_path, format="mp4")
+    async def async_start(self) -> bool:
+        """Connect to the live stream and wait for the first keyframe.
 
-    async def _async_on_video_track(self, track: Any) -> None:
-        """Start muxing the camera's video track to MP4."""
-        self._recorder.addTrack(track)
-        await self._recorder.start()
+        Returns True once video is being written, False if none arrived
+        within RECORDING_START_TIMEOUT (the session is then stopped).
+        """
+        try:
+            self._reader = self._coordinator.live_stream.open()
+        except StreamClosedError:
+            return False
+        self._muxer = StreamMuxer(self._output_path, "mp4", transcode=True)
+        self._task = asyncio.get_running_loop().create_task(self._async_write())
+        try:
+            await asyncio.wait_for(
+                self._started.wait(), timeout=RECORDING_START_TIMEOUT
+            )
+        except TimeoutError:
+            _LOGGER.warning("Recording: no video from the camera")
+            await self.async_stop()
+            return False
+        if self._task.done():
+            await self.async_stop()
+            return False
+        return True
 
-    async def _async_close_media(self) -> None:
-        """Stop the MediaRecorder (finalizes the MP4)."""
-        if self._recorder is not None:
-            await self._recorder.stop()
+    async def _async_write(self) -> None:
+        assert self._reader is not None and self._muxer is not None
+        muxer = self._muxer
+        hass = self._coordinator.hass
+        try:
+            while True:
+                unit = await self._reader.get()
+                await hass.async_add_executor_job(muxer.write, unit)
+                if muxer.started:
+                    self._started.set()
+        except StreamClosedError:
+            pass
+        except Exception:
+            _LOGGER.exception("Recording failed")
+        finally:
+            self._started.set()  # unblock async_start
+
+    async def async_stop(self) -> None:
+        """Stop reading and finalize the MP4 file."""
+        if self._reader is not None:
+            self._reader.close()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self._muxer is not None:
+            muxer, self._muxer = self._muxer, None
+            try:
+                await self._coordinator.hass.async_add_executor_job(muxer.close)
+            except Exception:
+                _LOGGER.exception("Could not finalize recording")
 
 
 class RecordingManager:
@@ -204,15 +248,6 @@ class RecordingManager:
                 exc_info=True,
             )
             return False
-
-        # Wake camera if sleeping
-        if self._coordinator.camera_state != CameraState.AWAKE:
-            awoke = await self._coordinator.async_wake_camera()
-            if not awoke:
-                _LOGGER.warning(
-                    "Cannot record: camera did not wake"
-                )
-                return False
 
         # Generate output file path with .tmp suffix for crash safety
         now = dt_util.now()
