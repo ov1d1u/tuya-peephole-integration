@@ -3,14 +3,13 @@
 Creates an independent RTCPeerConnection inside Home Assistant (separate
 from the SDP proxy camera entity, which relays to the browser), negotiates
 SDP offer/answer via MQTT protocol 302, and hands the received video track
-to a subclass. Used by recording (MP4 muxing) and snapshots (one frame).
+to a subclass. Used by snapshots (one decoded frame).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import queue
 import re
 import time
 from collections.abc import Callable
@@ -320,45 +319,6 @@ def install_hole_skipping_jitter_buffer(receiver: Any) -> bool:
     return True
 
 
-class _EncodedFrameTap(queue.Queue):
-    """Stand-in for an RTCRtpReceiver's decoder queue that skips decoding.
-
-    aiortc puts (codec, encoded_frame) on this queue for its decoder thread.
-    The tap hands each encoded frame to a sink instead, so nothing is ever
-    decoded and the track's (unbounded) frame queue stays empty. Only the
-    None stop marker reaches the queue itself, which lets aiortc's decoder
-    thread exit normally when the receiver stops.
-    """
-
-    def __init__(self, sink: Callable[[bytes, int], None]) -> None:
-        super().__init__()
-        self._sink = sink
-
-    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
-        if item is None:
-            super().put(None, block, timeout)
-            return
-        _codec, encoded_frame = item
-        self._sink(encoded_frame.data, encoded_frame.timestamp)
-
-
-def install_encoded_frame_tap(
-    receiver: Any, sink: Callable[[bytes, int], None]
-) -> bool:
-    """Route a fresh RTCRtpReceiver's encoded frames to sink, undecoded.
-
-    sink(data, timestamp) is called on the event loop with each reassembled
-    frame (Annex-B bytes, 90 kHz timestamp starting at 0). Must run before
-    the receiver starts, since its decoder thread binds the queue then.
-    """
-    attr = "_RTCRtpReceiver__decoder_queue"
-    if getattr(receiver, attr, None) is None:
-        _LOGGER.debug("Cannot install encoded frame tap")
-        return False
-    setattr(receiver, attr, _EncodedFrameTap(sink))
-    return True
-
-
 if AIORTC_AVAILABLE:
     patch_aiortc_h264_depayloader()
     patch_aiortc_h264_decoder()
@@ -456,9 +416,6 @@ class ServerWebRTCSession:
     def _setup_media(self) -> None:
         """Prepare media sinks after the PeerConnection is created."""
 
-    def _setup_video_receiver(self, receiver: Any) -> None:
-        """Adjust the video receiver before it starts (raise to abort)."""
-
     async def _async_on_video_track(self, track: Any) -> None:
         """Handle the camera's video track."""
 
@@ -521,7 +478,6 @@ class ServerWebRTCSession:
                 "video", direction="recvonly"
             )
             install_hole_skipping_jitter_buffer(transceiver.receiver)
-            self._setup_video_receiver(transceiver.receiver)
 
             # Step 6: Register track handler
             @self._pc.on("track")

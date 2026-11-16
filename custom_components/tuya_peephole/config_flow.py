@@ -11,7 +11,7 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlowWithConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigFlow
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
@@ -47,13 +47,6 @@ class TuyaPeepholeConfigFlow(ConfigFlow, domain=DOMAIN):
     _api: TuyaSmartAPI | None = None
     _devices: list[dict[str, Any]] = []
     _credentials: dict[str, Any] = {}
-
-    @staticmethod
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> TuyaPeepholeOptionsFlow:
-        """Create the options flow handler."""
-        return TuyaPeepholeOptionsFlow(config_entry)
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -260,33 +253,4 @@ class TuyaPeepholeConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reauth_confirm",
             data_schema=reauth_schema,
             errors=errors,
-        )
-
-
-class TuyaPeepholeOptionsFlow(OptionsFlowWithConfigEntry):
-    """Handle options flow for Tuya Peephole Camera."""
-
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the initial options step."""
-        if user_input is not None:
-            return self.async_create_entry(data=user_input)
-
-        return self.async_show_form(
-            step_id="init",
-            data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(
-                    {
-                        vol.Required("recording_enabled", default=True): bool,
-                        vol.Required(
-                            "retention_days", default=7
-                        ): vol.All(int, vol.Range(min=1, max=30)),
-                        vol.Required(
-                            "recording_duration", default=60
-                        ): vol.All(int, vol.Range(min=10, max=300)),
-                    }
-                ),
-                self.options,
-            ),
         )

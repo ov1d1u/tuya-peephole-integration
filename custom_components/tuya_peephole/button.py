@@ -1,8 +1,7 @@
 """Button entities for the Tuya Peephole Camera integration.
 
-Provides wake and snapshot button entities:
-- TuyaWakeButton: triggers the camera wake-up sequence
-- TuyaSnapshotButton: grabs a frame from the live stream as a snapshot
+Provides the snapshot button, which wakes the camera and grabs a frame
+from its live stream for the snapshot image entity.
 """
 
 from __future__ import annotations
@@ -35,48 +34,7 @@ async def async_setup_entry(
         async_add_entities: Callback to register new entities.
     """
     coordinator: TuyaPeepholeCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([
-        TuyaWakeButton(coordinator),
-        TuyaSnapshotButton(coordinator),
-    ])
-
-
-class TuyaWakeButton(TuyaPeepholeEntity, ButtonEntity):
-    """Wake camera button entity.
-
-    Sends a CRC32 wake packet to the camera via the coordinator.
-    Always available -- the user should be able to attempt wake
-    even when MQTT is reconnecting (the coordinator handles
-    cooldown and state transitions).
-    """
-
-    _attr_icon = "mdi:alarm-light-outline"
-
-    def __init__(self, coordinator: TuyaPeepholeCoordinator) -> None:
-        """Initialize the wake button.
-
-        Args:
-            coordinator: The Tuya Peephole coordinator instance.
-        """
-        super().__init__(coordinator, "wake_camera", "Wake Camera")
-
-    @property
-    def available(self) -> bool:
-        """Return True always.
-
-        The wake button is always available so users can attempt
-        to wake the camera even during MQTT reconnection. The
-        coordinator handles the case where MQTT is not connected.
-        """
-        return True
-
-    async def async_press(self) -> None:
-        """Handle button press -- send wake command to camera.
-
-        Delegates to the coordinator which handles CRC32 payload
-        creation, MQTT publishing, cooldown, and state transitions.
-        """
-        await self.coordinator.async_wake_camera()
+    async_add_entities([TuyaSnapshotButton(coordinator)])
 
 
 class TuyaSnapshotButton(TuyaPeepholeEntity, ButtonEntity):

@@ -1,13 +1,10 @@
 """Tests for WebRTC signaling helpers (protocol 302 message format, SDP/ICE manipulation).
 
-Covers all 9 exported functions from webrtc_signaling.py:
+Covers all 6 exported functions from webrtc_signaling.py:
 - generate_session_id
 - strip_sdp_extmap
-- clean_candidate_from_camera
-- format_candidate_for_camera
 - build_protocol_302_message
 - build_offer_payload
-- build_candidate_payload
 - build_disconnect_payload
 - parse_protocol_302_message
 
@@ -19,7 +16,6 @@ from __future__ import annotations
 import json
 import string
 
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -118,77 +114,6 @@ class TestStripSdpExtmap:
 
         result = strip_sdp_extmap(sample_sdp_offer)
         assert "extmap-allow-mixed" not in result
-
-
-# ---------------------------------------------------------------------------
-# clean_candidate_from_camera tests
-# ---------------------------------------------------------------------------
-
-
-class TestCleanCandidateFromCamera:
-    """Tests for cleaning ICE candidates received from camera."""
-
-    @pytest.mark.parametrize(
-        "raw,expected",
-        [
-            (
-                "a=candidate:1 1 udp 2113937151 192.168.1.1 5000 typ host\r\n",
-                "candidate:1 1 udp 2113937151 192.168.1.1 5000 typ host",
-            ),
-            (
-                "candidate:1 1 udp 2113937151 192.168.1.1 5000 typ host",
-                "candidate:1 1 udp 2113937151 192.168.1.1 5000 typ host",
-            ),
-            (
-                "candidate:1 1 udp\r\n",
-                "candidate:1 1 udp",
-            ),
-            (
-                "a=candidate:relay 1 tcp 5000\r\n",
-                "candidate:relay 1 tcp 5000",
-            ),
-        ],
-        ids=[
-            "a_prefix_and_crlf",
-            "no_prefix_no_crlf",
-            "crlf_only",
-            "a_prefix_with_crlf",
-        ],
-    )
-    def test_clean_candidate(self, raw: str, expected: str) -> None:
-        """Candidate is cleaned of a= prefix and \\r\\n suffix."""
-        from custom_components.tuya_peephole.webrtc_signaling import (
-            clean_candidate_from_camera,
-        )
-
-        assert clean_candidate_from_camera(raw) == expected
-
-
-# ---------------------------------------------------------------------------
-# format_candidate_for_camera tests
-# ---------------------------------------------------------------------------
-
-
-class TestFormatCandidateForCamera:
-    """Tests for formatting ICE candidates for camera consumption."""
-
-    def test_format_adds_prefix(self) -> None:
-        """Candidate without a= prefix gets it added."""
-        from custom_components.tuya_peephole.webrtc_signaling import (
-            format_candidate_for_camera,
-        )
-
-        result = format_candidate_for_camera("candidate:1 1 udp 2113937151")
-        assert result == "a=candidate:1 1 udp 2113937151"
-
-    def test_format_no_double_prefix(self) -> None:
-        """Candidate already with a= prefix is not doubled."""
-        from custom_components.tuya_peephole.webrtc_signaling import (
-            format_candidate_for_camera,
-        )
-
-        result = format_candidate_for_camera("a=candidate:1 1 udp 2113937151")
-        assert result == "a=candidate:1 1 udp 2113937151"
 
 
 # ---------------------------------------------------------------------------
@@ -304,25 +229,6 @@ class TestBuildOfferPayload:
             stream_type=1,
         )
         assert payload["stream_type"] == 1
-
-
-# ---------------------------------------------------------------------------
-# build_candidate_payload tests
-# ---------------------------------------------------------------------------
-
-
-class TestBuildCandidatePayload:
-    """Tests for the protocol 302 candidate payload builder."""
-
-    def test_candidate_payload(self) -> None:
-        """Candidate payload has mode and candidate fields."""
-        from custom_components.tuya_peephole.webrtc_signaling import (
-            build_candidate_payload,
-        )
-
-        payload = build_candidate_payload("a=candidate:1 1 udp 2113937151")
-        assert payload["mode"] == "webrtc"
-        assert payload["candidate"] == "a=candidate:1 1 udp 2113937151"
 
 
 # ---------------------------------------------------------------------------

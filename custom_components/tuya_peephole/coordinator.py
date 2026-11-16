@@ -12,8 +12,6 @@ import logging
 import struct
 import time as _time
 import zlib
-from collections import deque
-from collections.abc import Callable
 from typing import Any
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -22,10 +20,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import TuyaSmartAPI
 from .const import (
-    CHARGING_STABLE_MINUTES,
-    DOORBELL_RING_TIMEOUT,
-    EVENT_DOORBELL,
-    EVENT_HISTORY_LIMIT,
     MOTION_CLEAR_TIMEOUT,
     MQTT_PORT,
     MQTT_RECONNECT_MAX_DELAY,
@@ -107,9 +101,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.mqtt_client: TuyaMQTTClient | None = None
         self._camera_state = CameraState.SLEEPING
         self._motion_detected = False
-        self._battery_percentage: int | None = None
-        self._signal_strength: int | None = None
-        self._last_events: list[dict[str, Any]] = []
         self._motion_clear_unsub: CALLBACK_TYPE | None = None
         self._wake_cooldown = False
         self._awake_event = asyncio.Event()
@@ -120,18 +111,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # which the asyncio socket-callback integration does not use)
         self._reconnect_task: asyncio.Task[None] | None = None
         self._shutting_down = False
-
-        # Motion callback registration for recording manager
-        self._on_motion_callbacks: list[Callable[[], None]] = []
-
-        # Doorbell rings (MQTT protocol 43)
-        self._on_doorbell_callbacks: list[Callable[[dict[str, Any]], None]] = []
-        self._seen_doorbell_ids: deque[str] = deque(maxlen=50)
-        self.last_doorbell: dict[str, Any] | None = None
-
-        # Charging detection heuristic
-        self._charging_detected = False
-        self._battery_100_since: float | None = None  # monotonic time when battery first hit 100
 
         # Last snapshot (JPEG) grabbed from the WebRTC stream
         self._snapshot_lock = asyncio.Lock()
@@ -193,10 +172,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return {
             "camera_state": self._camera_state,
             "motion_detected": self._motion_detected,
-            "battery_percentage": self._battery_percentage,
-            "signal_strength": self._signal_strength,
-            "last_events": self._last_events,
-            "is_charging": self._charging_detected,
         }
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -228,12 +203,10 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         or from a paho thread. Use call_soon_threadsafe for safety.
         """
         _LOGGER.debug(
-            "Processing MQTT: topic=%s awake=%s motion=%s battery=%s signal=%s raw=%s",
+            "Processing MQTT: topic=%s awake=%s motion=%s raw=%s",
             message.topic,
             message.is_wireless_awake,
             message.is_motion,
-            message.battery_percentage,
-            message.signal_strength,
             message.raw[:100].decode("utf-8", errors="replace") if message.raw else "",
         )
 
@@ -249,21 +222,9 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._camera_state = CameraState.AWAKE
             self._awake_event.set()
 
-        if (call := message.doorbell_call) is not None:
-            self._handle_doorbell_call(call)
-
         if message.is_motion:
             self._motion_detected = True
             self._schedule_motion_clear()
-            for cb in self._on_motion_callbacks:
-                cb()
-
-        if message.battery_percentage is not None:
-            self._battery_percentage = message.battery_percentage
-        if message.signal_strength is not None:
-            self._signal_strength = message.signal_strength
-
-        self._update_charging_state()
 
         # Push state update to all entities
         try:
@@ -439,23 +400,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.async_set_updated_data(self._build_state_dict())
             return image
 
-    async def async_fetch_events(self) -> list[dict[str, Any]]:
-        """Fetch recent events from Tuya Message Center API.
-
-        Returns list of event dicts. Stores result in _last_events
-        and includes in next push data update.
-        """
-        try:
-            events = await self.api.async_get_message_list(
-                self.device_id, limit=EVENT_HISTORY_LIMIT
-            )
-            self._last_events = events
-            self.async_set_updated_data(self._build_state_dict())
-            return events
-        except Exception:
-            _LOGGER.warning("Failed to fetch event history", exc_info=True)
-            return self._last_events
-
     @callback
     def _reset_cooldown(self, _now: Any) -> None:
         """Reset the wake cooldown flag after WAKE_COOLDOWN seconds."""
@@ -468,8 +412,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         so MQTT credentials are refreshed on reconnection.
         """
         self._camera_state = CameraState.SLEEPING
-        self._charging_detected = False
-        self._battery_100_since = None
         self.api.invalidate_cache()
         _LOGGER.warning(
             "MQTT disconnected, camera state reset to SLEEPING"
@@ -551,93 +493,6 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.mqtt_client = None
 
         _LOGGER.debug("Coordinator teardown complete for %s", self.device_id)
-
-    def register_motion_callback(
-        self, callback: Callable[[], None]
-    ) -> Callable[[], None]:
-        """Register a callback to be called on motion events.
-
-        Returns an unsubscribe function.
-        """
-        self._on_motion_callbacks.append(callback)
-
-        def _unsub() -> None:
-            self._on_motion_callbacks.remove(callback)
-
-        return _unsub
-
-    def register_doorbell_callback(
-        self, callback: Callable[[dict[str, Any]], None]
-    ) -> Callable[[], None]:
-        """Register a callback called with each new doorbell ring.
-
-        Returns an unsubscribe function.
-        """
-        self._on_doorbell_callbacks.append(callback)
-
-        def _unsub() -> None:
-            self._on_doorbell_callbacks.remove(callback)
-
-        return _unsub
-
-    def _handle_doorbell_call(self, call: dict[str, Any]) -> None:
-        """Handle a doorbell ring (MQTT protocol 43).
-
-        Mirrors the official app: a ring is reported once per message id,
-        and rings older than DOORBELL_RING_TIMEOUT are dropped (they are
-        replays delivered after a reconnect).
-        """
-        message_id = call["message_id"]
-        if message_id in self._seen_doorbell_ids:
-            return
-        self._seen_doorbell_ids.append(message_id)
-
-        ring_time = call.get("time")
-        if ring_time is not None and _time.time() - ring_time > DOORBELL_RING_TIMEOUT:
-            _LOGGER.debug("Ignoring stale doorbell ring %s", message_id)
-            return
-
-        _LOGGER.info("Doorbell ring (%s, message %s)", call["type"], message_id)
-        self.last_doorbell = call
-        self.hass.bus.async_fire(
-            EVENT_DOORBELL,
-            {
-                "device_id": self.device_id,
-                "message_id": message_id,
-                "type": call["type"],
-                "time": ring_time,
-            },
-        )
-        for cb in list(self._on_doorbell_callbacks):
-            cb(call)
-
-    def _update_charging_state(self) -> None:
-        """Update charging state based on battery percentage heuristic.
-
-        If battery_percentage == 100 for CHARGING_STABLE_MINUTES continuously,
-        consider the camera on charger. If battery drops below 100, reset.
-        """
-        if self._battery_percentage == 100:
-            if self._battery_100_since is None:
-                self._battery_100_since = _time.monotonic()
-            elif (
-                _time.monotonic() - self._battery_100_since
-            ) >= CHARGING_STABLE_MINUTES * 60:
-                if not self._charging_detected:
-                    self._charging_detected = True
-                    _LOGGER.info("Charging detected (battery=100 sustained)")
-        else:
-            if self._charging_detected:
-                self._charging_detected = False
-                _LOGGER.info(
-                    "Charger disconnected (battery dropped below 100)"
-                )
-            self._battery_100_since = None
-
-    @property
-    def is_charging(self) -> bool:
-        """Return True if camera appears to be on charger."""
-        return self._charging_detected
 
     @property
     def camera_state(self) -> CameraState:

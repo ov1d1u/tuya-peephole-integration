@@ -1,7 +1,8 @@
 """Tuya Peephole Camera integration for Home Assistant.
 
-Sets up the coordinator, forwards entity platforms (binary_sensor, button),
-and manages token refresh and clean teardown.
+Sets up the coordinator, forwards the entity platforms (motion sensor,
+snapshot button and snapshot image), and manages token refresh and clean
+teardown.
 """
 
 from __future__ import annotations
@@ -11,8 +12,9 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
@@ -24,12 +26,9 @@ from .const import (
     CONF_PASSWORD,
     CONF_REGION,
     DOMAIN,
-    RECORDING_DURATION,
     REGIONS,
-    RETENTION_DAYS,
     TOKEN_REFRESH_HOURS,
 )
-from .recorder import RecordingManager
 from .coordinator import TuyaPeepholeCoordinator
 from .exceptions import TuyaApiError, TuyaAuthError
 
@@ -40,11 +39,32 @@ TOKEN_REFRESH_INTERVAL = timedelta(hours=TOKEN_REFRESH_HOURS)
 PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
-    Platform.CAMERA,
-    Platform.EVENT,
     Platform.IMAGE,
-    Platform.SENSOR,
 ]
+
+# Unique id suffixes of entities that earlier versions created (live view,
+# doorbell, battery/signal sensors, awake sensor, wake button). Their
+# registry entries are removed so they don't linger as unavailable.
+REMOVED_ENTITY_KEYS = (
+    "camera",
+    "doorbell",
+    "battery",
+    "signal_strength",
+    "camera_awake",
+    "wake_camera",
+)
+
+
+def _async_remove_stale_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete registry entries of entities this version no longer provides."""
+    registry = er.async_get(hass)
+    stale = {
+        f"{entry.data[CONF_DEVICE_ID]}_{key}" for key in REMOVED_ENTITY_KEYS
+    }
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if entity.unique_id in stale:
+            _LOGGER.info("Removing entity no longer provided: %s", entity.entity_id)
+            registry.async_remove(entity.entity_id)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -89,7 +109,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
-    # Forward entity platforms (binary_sensor, button)
+    _async_remove_stale_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Proactive token refresh every 6 hours (before session expiry)
@@ -113,70 +133,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     entry.async_on_unload(unsub)
 
-    # Set up recording manager
-    recording_manager = RecordingManager(hass, coordinator)
-    await recording_manager.async_setup()
-
-    # Apply options if already configured
-    options = entry.options
-    if options:
-        recording_manager.update_options(
-            retention_days=options.get("retention_days", RETENTION_DAYS),
-            duration=options.get("recording_duration", RECORDING_DURATION),
-            enabled=options.get("recording_enabled", True),
-        )
-
-    # Store recording manager alongside coordinator
-    hass.data[DOMAIN][f"{entry.entry_id}_recorder"] = recording_manager
-
-    # Listen for options changes
-    async def _async_options_updated(
-        hass_ref: HomeAssistant, entry_ref: ConfigEntry
-    ) -> None:
-        """Update recording manager when options change."""
-        rec_mgr: RecordingManager | None = hass_ref.data.get(DOMAIN, {}).get(
-            f"{entry_ref.entry_id}_recorder"
-        )
-        if rec_mgr is not None:
-            rec_mgr.update_options(
-                retention_days=entry_ref.options.get(
-                    "retention_days", RETENTION_DAYS
-                ),
-                duration=entry_ref.options.get(
-                    "recording_duration", RECORDING_DURATION
-                ),
-                enabled=entry_ref.options.get("recording_enabled", True),
-            )
-
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
-
-    # Monitor charging state for continuous recording. Coordinator listeners
-    # must be plain callbacks (HA never awaits them), and stopping continuous
-    # mode also stops the active recording, so act only when charging flips.
-    was_charging = False
-
-    @callback
-    def _on_coordinator_update() -> None:
-        """Start/stop continuous recording when the charging state changes."""
-        nonlocal was_charging
-        charging = bool(coordinator.is_charging)
-        if charging == was_charging:
-            return
-        rec_mgr: RecordingManager | None = hass.data.get(DOMAIN, {}).get(
-            f"{entry.entry_id}_recorder"
-        )
-        if rec_mgr is None:
-            return
-        was_charging = charging
-        if charging:
-            hass.async_create_task(rec_mgr.async_start_continuous())
-        else:
-            hass.async_create_task(rec_mgr.async_stop_continuous())
-
-    entry.async_on_unload(
-        coordinator.async_add_listener(_on_coordinator_update)
-    )
-
     _LOGGER.info(
         "Tuya Peephole integration set up for device %s",
         entry.data[CONF_DEVICE_ID],
@@ -195,13 +151,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry, PLATFORMS
     )
     if unload_ok:
-        # Tear down recording manager first
-        recording_manager: RecordingManager | None = hass.data[DOMAIN].pop(
-            f"{entry.entry_id}_recorder", None
-        )
-        if recording_manager is not None:
-            await recording_manager.async_teardown()
-
         coordinator: TuyaPeepholeCoordinator = hass.data[DOMAIN].pop(
             entry.entry_id
         )

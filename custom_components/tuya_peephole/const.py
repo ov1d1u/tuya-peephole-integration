@@ -45,8 +45,6 @@ WAKE_COOLDOWN = 5  # seconds between wake requests
 # The official app resends the wake packet every second until the camera
 # wakes, unless the cloud supplies its own schedule (p2pConfig.wakeScheduleMs)
 WAKE_RESEND_INTERVAL = 1  # seconds
-DOORBELL_RING_TIMEOUT = 25  # seconds a ring lasts (app default); older rings are ignored
-EVENT_DOORBELL = "tuya_peephole_doorbell"  # HA event fired on each ring
 MOTION_CLEAR_TIMEOUT = 30  # seconds before motion auto-clears
 
 # WebRTC signaling settings
@@ -54,22 +52,7 @@ WEBRTC_SESSION_TIMEOUT = 30  # seconds to wait for SDP answer from camera
 WEBRTC_PUBLISH_TOPIC_TEMPLATE = "/av/moto/{moto_id}/u/{device_id}"
 WEBRTC_SUBSCRIBE_TOPIC_TEMPLATE = "/av/u/{msid}"
 WEBRTC_STREAM_TYPE_HD = 0
-WEBRTC_STREAM_TYPE_SD = 1
-
-# Event history settings
-EVENT_HISTORY_CACHE_TTL = 300  # 5-minute cache for event history
-EVENT_HISTORY_LIMIT = 20  # Number of recent events to fetch
 
 # Snapshot settings
 SNAPSHOT_TIMEOUT = 15  # seconds to wait for snapshot frame
 SNAPSHOT_SKIP_FRAMES = 5  # decoded frames to skip while the stream settles
-
-# Recording settings
-RECORDING_DURATION = 60  # seconds per motion-triggered clip
-RETENTION_DAYS = 7  # default days to keep recordings
-MIN_FREE_SPACE_MB = 100  # skip recording if free disk < 100MB
-RECORDING_WATCHDOG_MULTIPLIER = 2  # kill stale sessions after 2x duration
-CONTINUOUS_RECONNECT_MIN = 5  # seconds, initial backoff for continuous mode reconnect
-CONTINUOUS_RECONNECT_MAX = 120  # seconds, max backoff
-CHARGING_STABLE_MINUTES = 5  # battery=100 sustained this long implies charging
-RECORDING_STORAGE_SUBDIR = "tuya_peephole"  # under hass.config.path("media/")

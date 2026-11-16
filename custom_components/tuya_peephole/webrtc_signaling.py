@@ -31,28 +31,6 @@ def strip_sdp_extmap(sdp: str) -> str:
     return re.sub(r"\r\na=extmap[^\r\n]*", "", sdp)
 
 
-def clean_candidate_from_camera(raw_candidate: str) -> str:
-    """Strip 'a=' prefix and '\\r\\n' suffix from camera ICE candidates for browser consumption.
-
-    Source: go2rtc mqtt.go onMqttCandidate().
-    """
-    candidate = raw_candidate
-    if candidate.startswith("a="):
-        candidate = candidate[2:]
-    candidate = candidate.rstrip("\r\n")
-    return candidate
-
-
-def format_candidate_for_camera(candidate: str) -> str:
-    """Prepend 'a=' prefix to browser ICE candidates for camera consumption.
-
-    Source: go2rtc mqtt.go SendCandidate().
-    """
-    if not candidate.startswith("a="):
-        return f"a={candidate}"
-    return candidate
-
-
 def build_protocol_302_message(
     msg_type: str,
     uid: str,
@@ -124,21 +102,6 @@ def build_offer_payload(
         "auth": auth,
         "datachannel_enable": datachannel_enable,
         "token": ice_servers,
-    }
-
-
-def build_candidate_payload(candidate: str) -> dict[str, Any]:
-    """Build protocol 302 candidate msg payload.
-
-    Args:
-        candidate: ICE candidate string.
-
-    Returns:
-        Candidate payload dict for protocol 302 msg field.
-    """
-    return {
-        "mode": "webrtc",
-        "candidate": candidate,
     }
 
 

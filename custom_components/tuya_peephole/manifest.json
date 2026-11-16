@@ -1,7 +1,7 @@
 {
   "domain": "tuya_peephole",
   "name": "Tuya Peephole Camera",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "codeowners": ["@JustDauren"],
   "config_flow": true,
   "dependencies": [],

@@ -38,21 +38,5 @@
       "device_not_found": "Selected device not found. Try again.",
       "unknown": "Unexpected error. Check logs for details."
     }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Recording Settings",
-        "data": {
-          "recording_enabled": "Enable recording",
-          "retention_days": "Retention (days)",
-          "recording_duration": "Recording duration (seconds)"
-        },
-        "data_description": {
-          "retention_days": "Recordings older than this will be automatically deleted (1-30 days)",
-          "recording_duration": "Duration of each motion-triggered recording (10-300 seconds)"
-        }
-      }
-    }
   }
 }

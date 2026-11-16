@@ -45,20 +45,7 @@ def _make_mock_coordinator():
     mock_coord.async_connect_mqtt = AsyncMock()
     mock_coord.async_config_entry_first_refresh = AsyncMock()
     mock_coord.async_teardown = AsyncMock()
-    mock_coord.is_charging = False
-    mock_coord.async_add_listener = MagicMock(return_value=MagicMock())
     return mock_coord
-
-
-def _make_mock_recording_manager():
-    """Create a mock RecordingManager for patching."""
-    mock_rm = MagicMock()
-    mock_rm.async_setup = AsyncMock()
-    mock_rm.async_teardown = AsyncMock()
-    mock_rm.update_options = MagicMock()
-    mock_rm.async_start_continuous = AsyncMock()
-    mock_rm.async_stop_continuous = AsyncMock()
-    return mock_rm
 
 
 class TestAsyncSetupEntry:
@@ -74,7 +61,6 @@ class TestAsyncSetupEntry:
         mock_api = MagicMock()
         mock_api.async_login = AsyncMock(return_value={"sid": "test_sid"})
         mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
 
         mock_unsub = MagicMock()
 
@@ -94,10 +80,6 @@ class TestAsyncSetupEntry:
             patch(
                 "custom_components.tuya_peephole.async_track_time_interval",
                 return_value=mock_unsub,
-            ),
-            patch(
-                "custom_components.tuya_peephole.RecordingManager",
-                return_value=mock_rm,
             ),
         ):
             result = await setup_entry(mock_hass, mock_config_entry)
@@ -119,7 +101,6 @@ class TestAsyncSetupEntry:
         mock_api = MagicMock()
         mock_api.async_login = AsyncMock(return_value={"sid": "test_sid"})
         mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
 
         mock_unsub = MagicMock()
 
@@ -140,10 +121,6 @@ class TestAsyncSetupEntry:
                 "custom_components.tuya_peephole.async_track_time_interval",
                 return_value=mock_unsub,
             ) as mock_track,
-            patch(
-                "custom_components.tuya_peephole.RecordingManager",
-                return_value=mock_rm,
-            ),
         ):
             await setup_entry(mock_hass, mock_config_entry)
 
@@ -166,7 +143,6 @@ class TestAsyncSetupEntry:
         mock_api = MagicMock()
         mock_api.async_login = AsyncMock(return_value={"sid": "test_sid"})
         mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
 
         mock_unsub = MagicMock()
 
@@ -186,10 +162,6 @@ class TestAsyncSetupEntry:
             patch(
                 "custom_components.tuya_peephole.async_track_time_interval",
                 return_value=mock_unsub,
-            ),
-            patch(
-                "custom_components.tuya_peephole.RecordingManager",
-                return_value=mock_rm,
             ),
         ):
             await setup_entry(mock_hass, mock_config_entry)
@@ -263,12 +235,10 @@ class TestAsyncUnloadEntry:
         unload_entry = _get_unload_entry()
 
         mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
 
-        # Set up hass.data as if setup had run (coordinator + recorder pattern)
+        # Set up hass.data as if setup had run 
         mock_hass.data[DOMAIN] = {
             mock_config_entry.entry_id: mock_coord,
-            f"{mock_config_entry.entry_id}_recorder": mock_rm,
         }
         # Mock async_unload_platforms to return True
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
@@ -278,7 +248,6 @@ class TestAsyncUnloadEntry:
         assert result is True
         assert mock_config_entry.entry_id not in mock_hass.data[DOMAIN]
         mock_coord.async_teardown.assert_awaited_once()
-        mock_rm.async_teardown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_unload_entry_platform_unload_fails(
@@ -288,11 +257,9 @@ class TestAsyncUnloadEntry:
         unload_entry = _get_unload_entry()
 
         mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
 
         mock_hass.data[DOMAIN] = {
             mock_config_entry.entry_id: mock_coord,
-            f"{mock_config_entry.entry_id}_recorder": mock_rm,
         }
         # Mock async_unload_platforms to return False
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
@@ -302,71 +269,31 @@ class TestAsyncUnloadEntry:
         assert result is False
         # Coordinator should NOT be torn down if platforms failed to unload
         mock_coord.async_teardown.assert_not_awaited()
-        mock_rm.async_teardown.assert_not_awaited()
 
 
-class TestChargingListener:
-    """Continuous recording follows charging changes via a sync listener."""
+class TestStaleEntityCleanup:
+    """Entities dropped from earlier versions are removed from the registry."""
 
-    @pytest.mark.asyncio
-    async def test_listener_is_sync_and_acts_on_transitions_only(
-        self, mock_hass: MagicMock, mock_config_entry: object
-    ) -> None:
-        import inspect
+    def test_removes_only_dropped_entities(self, mock_config_entry: object) -> None:
+        from custom_components.tuya_peephole import _async_remove_stale_entities
 
-        setup_entry = _get_setup_entry()
-        mock_api = MagicMock()
-        mock_api.async_login = AsyncMock(return_value={"sid": "test_sid"})
-        mock_coord = _make_mock_coordinator()
-        mock_rm = _make_mock_recording_manager()
-
+        device_id = mock_config_entry.data[CONF_DEVICE_ID]
+        entries = [
+            MagicMock(unique_id=f"{device_id}_{key}", entity_id=f"x.{key}")
+            for key in ("camera", "battery", "wake_camera", "motion_detected", "snapshot")
+        ]
+        registry = MagicMock()
         with (
             patch(
-                "custom_components.tuya_peephole.async_create_clientsession",
-                return_value=MagicMock(),
+                "custom_components.tuya_peephole.er.async_get",
+                return_value=registry,
             ),
             patch(
-                "custom_components.tuya_peephole.TuyaSmartAPI",
-                return_value=mock_api,
-            ),
-            patch(
-                "custom_components.tuya_peephole.TuyaPeepholeCoordinator",
-                return_value=mock_coord,
-            ),
-            patch(
-                "custom_components.tuya_peephole.async_track_time_interval",
-                return_value=MagicMock(),
-            ),
-            patch(
-                "custom_components.tuya_peephole.RecordingManager",
-                return_value=mock_rm,
+                "custom_components.tuya_peephole.er.async_entries_for_config_entry",
+                return_value=entries,
             ),
         ):
-            await setup_entry(mock_hass, mock_config_entry)
+            _async_remove_stale_entities(MagicMock(), mock_config_entry)
 
-        listener = mock_coord.async_add_listener.call_args_list[-1].args[0]
-        # HA calls coordinator listeners without awaiting them
-        assert not inspect.iscoroutinefunction(listener)
-
-        mock_hass.async_create_task = MagicMock(
-            side_effect=lambda coro: coro.close()
-        )
-
-        start = mock_rm.async_start_continuous
-        stop = mock_rm.async_stop_continuous
-
-        # Not charging and no change: never touch an active recording
-        for _ in range(3):
-            listener()
-        assert (start.call_count, stop.call_count) == (0, 0)
-
-        mock_coord.is_charging = True
-        listener()
-        listener()
-        assert (start.call_count, stop.call_count) == (1, 0)
-
-        mock_coord.is_charging = False
-        listener()
-        listener()
-        assert (start.call_count, stop.call_count) == (1, 1)
-        assert mock_hass.async_create_task.call_count == 2
+        removed = [c.args[0] for c in registry.async_remove.call_args_list]
+        assert removed == ["x.camera", "x.battery", "x.wake_camera"]

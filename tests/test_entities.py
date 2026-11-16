@@ -8,7 +8,7 @@ Requirements covered: SENS-01 (motion sensor), CTRL-01 (wake button), REL-01 (av
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -165,125 +165,6 @@ class TestTuyaMotionSensor:
         assert sensor.available is False
 
 
-class TestTuyaAwakeSensor:
-    """Test TuyaAwakeSensor entity."""
-
-    def test_awake_sensor_unique_id_and_name(self, mock_coordinator) -> None:
-        """Awake sensor unique_id is {device_id}_camera_awake."""
-        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
-
-        sensor = TuyaAwakeSensor(mock_coordinator)
-
-        assert sensor._attr_unique_id == "test_device_id_abc123_camera_awake"
-        assert sensor._attr_name == "Camera Awake"
-
-    @pytest.mark.parametrize(
-        ("state", "expected"),
-        [
-            ("awake", True),
-            ("sleeping", False),
-            ("waking", False),
-        ],
-    )
-    def test_awake_sensor_is_on_from_string_state(
-        self, mock_coordinator, state, expected
-    ) -> None:
-        """is_on is True only when camera_state is awake."""
-        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
-
-        mock_coordinator.data = {"camera_state": state}
-        sensor = TuyaAwakeSensor(mock_coordinator)
-
-        assert sensor.is_on is expected
-        assert sensor.extra_state_attributes == {"camera_state": state}
-
-    def test_awake_sensor_accepts_enum_state(self, mock_coordinator) -> None:
-        """is_on handles the CameraState enum the coordinator actually pushes."""
-        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
-        from custom_components.tuya_peephole.models import CameraState
-
-        sensor = TuyaAwakeSensor(mock_coordinator)
-
-        mock_coordinator.data = {"camera_state": CameraState.AWAKE}
-        assert sensor.is_on is True
-        assert sensor.icon == "mdi:cctv"
-
-        mock_coordinator.data = {"camera_state": CameraState.SLEEPING}
-        assert sensor.is_on is False
-        assert sensor.icon == "mdi:sleep"
-        assert sensor.extra_state_attributes == {"camera_state": "sleeping"}
-
-    def test_awake_sensor_is_none_when_no_data(self, mock_coordinator) -> None:
-        """is_on returns None when coordinator has no data."""
-        from custom_components.tuya_peephole.binary_sensor import TuyaAwakeSensor
-
-        mock_coordinator.data = None
-        sensor = TuyaAwakeSensor(mock_coordinator)
-
-        assert sensor.is_on is None
-
-
-class TestTuyaWakeButton:
-    """Test TuyaWakeButton entity."""
-
-    def test_wake_button_icon(self, mock_coordinator) -> None:
-        """[CTRL-01] Wake button has mdi:alarm-light-outline icon."""
-        from custom_components.tuya_peephole.button import TuyaWakeButton
-
-        button = TuyaWakeButton(mock_coordinator)
-
-        assert button._attr_icon == "mdi:alarm-light-outline"
-
-    def test_wake_button_unique_id(self, mock_coordinator) -> None:
-        """Wake button unique_id is {device_id}_wake_camera."""
-        from custom_components.tuya_peephole.button import TuyaWakeButton
-
-        button = TuyaWakeButton(mock_coordinator)
-
-        assert button._attr_unique_id == "test_device_id_abc123_wake_camera"
-
-    def test_wake_button_name(self, mock_coordinator) -> None:
-        """Wake button name is 'Wake Camera'."""
-        from custom_components.tuya_peephole.button import TuyaWakeButton
-
-        button = TuyaWakeButton(mock_coordinator)
-
-        assert button._attr_name == "Wake Camera"
-
-    @pytest.mark.asyncio
-    async def test_wake_button_press_calls_coordinator(
-        self, mock_coordinator
-    ) -> None:
-        """[CTRL-01] async_press() calls coordinator.async_wake_camera()."""
-        from custom_components.tuya_peephole.button import TuyaWakeButton
-
-        mock_coordinator.async_wake_camera = AsyncMock(return_value=True)
-        button = TuyaWakeButton(mock_coordinator)
-
-        await button.async_press()
-
-        mock_coordinator.async_wake_camera.assert_awaited_once()
-
-    def test_wake_button_always_available(
-        self, mock_coordinator
-    ) -> None:
-        """[CTRL-01] Wake button is always available, even when MQTT disconnected."""
-        from custom_components.tuya_peephole.button import TuyaWakeButton
-
-        # MQTT connected
-        mock_coordinator.mqtt_client.is_connected = True
-        button = TuyaWakeButton(mock_coordinator)
-        assert button.available is True
-
-        # MQTT disconnected -- button should still be available
-        mock_coordinator.mqtt_client.is_connected = False
-        assert button.available is True
-
-        # No MQTT client at all -- button should still be available
-        mock_coordinator.mqtt_client = None
-        assert button.available is True
-
-
 class TestEntitySetupEntry:
     """Test async_setup_entry for entity platforms."""
 
@@ -308,17 +189,13 @@ class TestEntitySetupEntry:
 
         mock_add_entities.assert_called_once()
         entities = mock_add_entities.call_args[0][0]
-        assert len(entities) == 2
-        assert [type(e).__name__ for e in entities] == [
-            "TuyaMotionSensor",
-            "TuyaAwakeSensor",
-        ]
+        assert [type(e).__name__ for e in entities] == ["TuyaMotionSensor"]
 
     @pytest.mark.asyncio
     async def test_button_setup_entry(
         self, mock_hass_with_loop, mock_coordinator, mock_config_entry
     ) -> None:
-        """button.async_setup_entry creates TuyaWakeButton and TuyaSnapshotButton."""
+        """button.async_setup_entry creates only the snapshot button."""
         from custom_components.tuya_peephole.button import async_setup_entry
         from custom_components.tuya_peephole.const import DOMAIN
 
@@ -335,37 +212,4 @@ class TestEntitySetupEntry:
 
         mock_add_entities.assert_called_once()
         entities = mock_add_entities.call_args[0][0]
-        assert len(entities) == 2
-        names = {type(e).__name__ for e in entities}
-        assert "TuyaWakeButton" in names
-        assert "TuyaSnapshotButton" in names
-
-
-class TestTuyaDoorbellEvent:
-    """Test the doorbell event entity."""
-
-    def test_doorbell_event_identity(self, mock_coordinator) -> None:
-        from custom_components.tuya_peephole.event import TuyaDoorbellEvent
-
-        entity = TuyaDoorbellEvent(mock_coordinator)
-
-        assert entity._attr_unique_id == "test_device_id_abc123_doorbell"
-        assert entity._attr_device_class == "doorbell"
-        assert entity._attr_event_types == ["ring"]
-
-    def test_ring_triggers_event(self, mock_coordinator) -> None:
-        from unittest.mock import MagicMock
-
-        from custom_components.tuya_peephole.event import TuyaDoorbellEvent
-
-        entity = TuyaDoorbellEvent(mock_coordinator)
-        entity.async_write_ha_state = MagicMock()
-
-        entity._handle_ring(
-            {"message_id": "m1", "type": "doorbell", "time": 1.0}
-        )
-
-        assert entity.last_event == (
-            "ring", {"message_id": "m1", "call_type": "doorbell"}
-        )
-        entity.async_write_ha_state.assert_called_once()
+        assert [type(e).__name__ for e in entities] == ["TuyaSnapshotButton"]

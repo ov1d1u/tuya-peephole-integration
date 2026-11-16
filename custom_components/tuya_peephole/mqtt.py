@@ -320,7 +320,7 @@ class TuyaMQTTClient:
         """Unsubscribe from an MQTT topic.
 
         Skipped while other per-topic callbacks are still registered, so one
-        WebRTC session (live view, recording, snapshot) ending does not cut
+        WebRTC session (e.g. a snapshot) ending does not cut
         off signaling for another session sharing the same topic.
 
         Args:

@@ -106,7 +106,7 @@ async def async_capture_snapshot(
         _LOGGER.error("aiortc is not installed -- cannot capture snapshot")
         return None
 
-    # Same flow as live view: always send the CRC32 wake before an offer,
+    # Same flow as the official app's live view: always send the CRC32 wake before an offer,
     # and fetch fresh WebRTC config because auth tokens expire.
     if not await coordinator.async_wake_camera(force=True):
         _LOGGER.warning("Camera did not confirm wake, trying snapshot anyway")

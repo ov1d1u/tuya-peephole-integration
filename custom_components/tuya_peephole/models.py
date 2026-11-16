@@ -158,43 +158,6 @@ class TuyaMQTTMessage:
         return data.get("online") is False
 
     @property
-    def doorbell_call(self) -> dict[str, Any] | None:
-        """Return the doorbell ring in this message, if any.
-
-        The camera reports a ring as MQTT protocol 43:
-        {"protocol":43,"data":{"devId":...,"etype":"doorbell",
-        "edata":<message id>,"timestamp":<s or ms>}}. "etype" is
-        "doorbell" for a plain ring and "ac_doorbell" for a ring that
-        opens a video call in the app.
-
-        Returns:
-            Dict with message_id, type and time (epoch seconds), or None.
-        """
-        if self._json is None or self._json.get("protocol") != 43:
-            return None
-        data = self._json.get("data")
-        if not isinstance(data, dict):
-            return None
-        call_type = data.get("etype")
-        message_id = data.get("edata")
-        if not call_type or not message_id:
-            return None
-        raw_time = data.get("dataTimestamp") or data.get("timestamp")
-        if not raw_time:
-            raw_time = self._json.get("t")
-        try:
-            ring_time = float(raw_time)
-        except (TypeError, ValueError):
-            ring_time = None
-        if ring_time is not None and ring_time > 1e11:
-            ring_time /= 1000  # milliseconds
-        return {
-            "message_id": str(message_id),
-            "type": str(call_type),
-            "time": ring_time,
-        }
-
-    @property
     def is_motion(self) -> bool:
         """Check if this message indicates a motion/PIR event.
 
@@ -232,51 +195,6 @@ class TuyaMQTTMessage:
             keyword in text_lower
             for keyword in ("pir", "alarm_message", "movement_detect_pic")
         )
-
-    @property
-    def battery_percentage(self) -> int | None:
-        """Extract battery percentage from message data.
-
-        Checks 'battery_percentage' and 'residual_electricity' (Tuya alternate key).
-        Returns None if not present or not parseable. Clamped to 0-100.
-        """
-        if self._json is None:
-            return None
-        data = self._json.get("data")
-        if not isinstance(data, dict):
-            return None
-        raw = data.get("battery_percentage")
-        if raw is None:
-            raw = data.get("residual_electricity")
-        if raw is None:
-            return None
-        try:
-            value = int(raw)
-        except (ValueError, TypeError):
-            return None
-        return max(0, min(100, value))
-
-    @property
-    def signal_strength(self) -> int | None:
-        """Extract signal strength (RSSI) from message data.
-
-        Checks 'signal_strength' and 'wifi_signal' (Tuya alternate key).
-        Returns None if not present or not parseable. No clamping (RSSI is negative).
-        """
-        if self._json is None:
-            return None
-        data = self._json.get("data")
-        if not isinstance(data, dict):
-            return None
-        raw = data.get("signal_strength")
-        if raw is None:
-            raw = data.get("wifi_signal")
-        if raw is None:
-            return None
-        try:
-            return int(raw)
-        except (ValueError, TypeError):
-            return None
 
     @property
     def json_data(self) -> dict | None:

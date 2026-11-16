@@ -630,6 +630,17 @@ sys.modules["homeassistant.helpers.event"] = _ha_helpers_event
 sys.modules["homeassistant.helpers.update_coordinator"] = _ha_helpers_update_coordinator
 sys.modules["homeassistant.helpers.device_registry"] = _ha_helpers_device_registry
 sys.modules["homeassistant.helpers.entity_platform"] = _ha_helpers_entity_platform
+
+# homeassistant.helpers.entity_registry (stale entity cleanup at setup)
+_ha_helpers_entity_registry = types.ModuleType(
+    "homeassistant.helpers.entity_registry"
+)
+_ha_helpers_entity_registry.async_get = MagicMock()  # type: ignore[attr-defined]
+_ha_helpers_entity_registry.async_entries_for_config_entry = MagicMock(  # type: ignore[attr-defined]
+    return_value=[]
+)
+_ha_helpers.entity_registry = _ha_helpers_entity_registry  # type: ignore[attr-defined]
+sys.modules["homeassistant.helpers.entity_registry"] = _ha_helpers_entity_registry
 sys.modules["homeassistant.components"] = _ha_components
 sys.modules["homeassistant.components.binary_sensor"] = _ha_binary_sensor
 sys.modules["homeassistant.components.button"] = _ha_button

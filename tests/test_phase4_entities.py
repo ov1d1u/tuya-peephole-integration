@@ -60,18 +60,6 @@ class TestTuyaSnapshotButton:
         with pytest.raises(HomeAssistantError, match="Snapshot failed"):
             await button.async_press()
 
-    def test_button_setup_registers_both_buttons(
-        self, mock_hass_with_loop, mock_coordinator, mock_config_entry
-    ):
-        """async_setup_entry creates both wake and snapshot buttons."""
-        # Verify module structure -- both classes exist and are importable
-        from custom_components.tuya_peephole.button import (
-            TuyaWakeButton,
-            TuyaSnapshotButton,
-        )
-
-        assert TuyaWakeButton is not None
-        assert TuyaSnapshotButton is not None
 
 
 class TestReauthConfigFlow:

@@ -17,7 +17,7 @@ import aiohttp
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_der_public_key
 
-from .const import API_TIMEOUT, EVENT_HISTORY_CACHE_TTL, MQTT_WEBRTC_CACHE_TTL
+from .const import API_TIMEOUT, MQTT_WEBRTC_CACHE_TTL
 from .exceptions import TuyaApiError, TuyaAuthError
 
 _LOGGER = logging.getLogger(__name__)
@@ -82,8 +82,6 @@ class TuyaSmartAPI:
         self._mqtt_cache_time: float = 0
 
         # Message center cache (event history)
-        self._message_cache: list[dict[str, Any]] | None = None
-        self._message_cache_time: float = 0
 
     async def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
         """POST JSON to Tuya Smart API, re-logging in once if the session expired.
@@ -357,43 +355,6 @@ class TuyaSmartAPI:
         self._mqtt_cache_time = time.time()
         return self._mqtt_cache
 
-    async def async_get_message_list(
-        self, device_id: str, limit: int = 20
-    ) -> list[dict[str, Any]]:
-        """Get event messages from Tuya Message Center.
-
-        Retrieves recent doorbell/motion events for the device.
-        Results are cached for EVENT_HISTORY_CACHE_TTL seconds.
-
-        The Tuya Smart App API endpoint is /api/discovery/lite/msgcenter/msgList.
-        Request body: {"msgSrcId": device_id, "limit": limit, "offset": 0}
-
-        Args:
-            device_id: Tuya device ID.
-            limit: Maximum number of events to return.
-
-        Returns:
-            List of event dicts, each containing: msgId, msgTypeCode,
-            msgTitle, msgContent, time, icon, attachPic (thumbnail URL).
-        """
-        if (
-            self._message_cache is not None
-            and (time.time() - self._message_cache_time)
-            < EVENT_HISTORY_CACHE_TTL
-        ):
-            return self._message_cache
-
-        resp = await self._post(
-            "/api/discovery/lite/msgcenter/msgList",
-            {"msgSrcId": device_id, "limit": limit, "offset": 0},
-        )
-        result = resp.get("result", {})
-        # Tuya returns {"datas": [...], "totalCount": N}
-        events: list[dict[str, Any]] = result.get("datas", [])
-        self._message_cache = events
-        self._message_cache_time = time.time()
-        return events
-
     @property
     def cached_webrtc_config(self) -> dict[str, Any] | None:
         """Return the last jarvis/config result without fetching it."""
@@ -406,4 +367,3 @@ class TuyaSmartAPI:
         """
         self._webrtc_cache = None
         self._mqtt_cache = None
-        self._message_cache = None
