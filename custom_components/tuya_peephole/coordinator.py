@@ -25,6 +25,8 @@ from .const import (
     EVENT_HISTORY_LIMIT,
     MOTION_CLEAR_TIMEOUT,
     MQTT_PORT,
+    MQTT_RECONNECT_MAX_DELAY,
+    MQTT_RECONNECT_MIN_DELAY,
     WAKE_COOLDOWN,
     WAKE_TIMEOUT,
 )
@@ -81,6 +83,11 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._awake_event = asyncio.Event()
         self._sleep_event = asyncio.Event()
         self._msid: str | None = None
+
+        # MQTT reconnection (paho only auto-reconnects inside loop_forever,
+        # which the asyncio socket-callback integration does not use)
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._shutting_down = False
 
         # Motion callback registration for recording manager
         self._on_motion_callbacks: list[Callable[[], None]] = []
@@ -397,6 +404,57 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "MQTT disconnected, camera state reset to SLEEPING"
         )
         self.async_set_updated_data(self._build_state_dict())
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Start the background reconnect loop unless one is already running."""
+        if self._shutting_down:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._async_reconnect_loop(),
+            name=f"tuya_peephole_mqtt_reconnect_{self.device_id}",
+        )
+
+    async def _async_reconnect_loop(self) -> None:
+        """Reconnect to the MQTT broker with fresh credentials.
+
+        Each /api/jarvis/mqtt call mints a new msid/password pair, so a
+        plain paho reconnect() is not enough: the old client is discarded
+        and async_connect_mqtt() runs again. Retries with exponential
+        backoff until it succeeds or the coordinator is torn down.
+        """
+        delay = MQTT_RECONNECT_MIN_DELAY
+        attempt = 0
+        while not self._shutting_down:
+            await asyncio.sleep(delay)
+            if self._shutting_down:
+                return
+            attempt += 1
+
+            old_client = self.mqtt_client
+            self.mqtt_client = None
+            if old_client is not None:
+                try:
+                    await old_client.async_disconnect()
+                except Exception:
+                    _LOGGER.debug("Error discarding old MQTT client", exc_info=True)
+
+            self.api.invalidate_cache()
+            try:
+                await self.async_connect_mqtt()
+            except Exception as err:  # noqa: BLE001 - keep retrying
+                delay = min(delay * 2, MQTT_RECONNECT_MAX_DELAY)
+                _LOGGER.warning(
+                    "MQTT reconnect attempt %d failed: %s; retrying in %ds",
+                    attempt, err, delay,
+                )
+                continue
+
+            _LOGGER.info("MQTT reconnected after %d attempt(s)", attempt)
+            self.async_set_updated_data(self._build_state_dict())
+            return
 
     async def async_teardown(self) -> None:
         """Clean up coordinator resources.
@@ -404,6 +462,15 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Cancels motion clear timer and disconnects MQTT client.
         Must be called during config entry unload.
         """
+        self._shutting_down = True
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+
         if self._motion_clear_unsub is not None:
             self._motion_clear_unsub()
             self._motion_clear_unsub = None

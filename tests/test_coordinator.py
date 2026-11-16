@@ -363,6 +363,7 @@ class TestCoordinatorDisconnect:
         coordinator._camera_state = CameraState.AWAKE
 
         coordinator._handle_mqtt_disconnect()
+        mock_hass_with_loop.async_create_background_task.call_args[0][0].close()
 
         assert coordinator.camera_state == CameraState.SLEEPING
         mock_api.invalidate_cache.assert_called_once()
@@ -377,8 +378,110 @@ class TestCoordinatorDisconnect:
         coordinator._camera_state = CameraState.AWAKE
 
         coordinator._handle_mqtt_disconnect()
+        mock_hass_with_loop.async_create_background_task.call_args[0][0].close()
 
         assert coordinator.data["camera_state"] == CameraState.SLEEPING
+
+
+def _run_background_tasks_on_loop(hass):
+    """Make hass.async_create_background_task schedule real tasks."""
+    hass.async_create_background_task = MagicMock(
+        side_effect=lambda coro, name=None, **kw: asyncio.get_running_loop().create_task(coro)
+    )
+
+
+class TestCoordinatorReconnect:
+    """Test MQTT reconnection after an unexpected disconnect."""
+
+    def test_disconnect_schedules_reconnect(self, mock_hass_with_loop) -> None:
+        """A disconnect starts exactly one background reconnect task."""
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        created = []
+        mock_hass_with_loop.async_create_background_task = MagicMock(
+            side_effect=lambda coro, name=None: created.append(coro) or MagicMock(
+                done=MagicMock(return_value=False)
+            )
+        )
+
+        coordinator._handle_mqtt_disconnect()
+        coordinator._handle_mqtt_disconnect()
+
+        assert len(created) == 1
+        for coro in created:
+            coro.close()
+
+    def test_no_reconnect_after_teardown_started(self, mock_hass_with_loop) -> None:
+        """A disconnect caused by teardown does not schedule a reconnect."""
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator._shutting_down = True
+
+        coordinator._handle_mqtt_disconnect()
+
+        mock_hass_with_loop.async_create_background_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_retries_until_success(self, mock_hass_with_loop) -> None:
+        """Failed attempts back off and retry; success fetches fresh credentials."""
+        mock_api = MagicMock()
+        coordinator = _make_coordinator(mock_hass_with_loop, mock_api=mock_api)
+        old_client = _make_mock_mqtt_client(is_connected=False)
+        coordinator.mqtt_client = old_client
+        _run_background_tasks_on_loop(mock_hass_with_loop)
+
+        connect = AsyncMock(side_effect=[RuntimeError("boom"), RuntimeError("boom"), None])
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        with patch.object(coordinator, "async_connect_mqtt", connect), patch(
+            "custom_components.tuya_peephole.coordinator.asyncio.sleep", fake_sleep
+        ):
+            coordinator._handle_mqtt_disconnect()
+            await coordinator._reconnect_task
+
+        assert connect.await_count == 3
+        assert sleeps == [5, 10, 20]
+        old_client.async_disconnect.assert_awaited_once()
+        # Once from the disconnect handler, once per attempt
+        assert mock_api.invalidate_cache.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_reconnect_backoff_is_capped(self, mock_hass_with_loop) -> None:
+        """Backoff never exceeds MQTT_RECONNECT_MAX_DELAY."""
+        from custom_components.tuya_peephole.const import MQTT_RECONNECT_MAX_DELAY
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        connect = AsyncMock(side_effect=[RuntimeError("x")] * 10 + [None])
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        with patch.object(coordinator, "async_connect_mqtt", connect), patch(
+            "custom_components.tuya_peephole.coordinator.asyncio.sleep", fake_sleep
+        ):
+            await coordinator._async_reconnect_loop()
+
+        assert max(sleeps) == MQTT_RECONNECT_MAX_DELAY
+        assert sleeps[-1] == MQTT_RECONNECT_MAX_DELAY
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_reconnect(self, mock_hass_with_loop) -> None:
+        """Teardown cancels a pending reconnect and blocks new ones."""
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        _run_background_tasks_on_loop(mock_hass_with_loop)
+        connect = AsyncMock()
+
+        with patch.object(coordinator, "async_connect_mqtt", connect):
+            coordinator._handle_mqtt_disconnect()
+            task = coordinator._reconnect_task
+            await coordinator.async_teardown()
+
+        assert task.cancelled()
+        connect.assert_not_awaited()
+        coordinator._handle_mqtt_disconnect()
+        assert coordinator._reconnect_task is None
 
 
 class TestCoordinatorTeardown:
