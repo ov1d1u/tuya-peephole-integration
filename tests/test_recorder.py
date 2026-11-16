@@ -106,9 +106,11 @@ class TestRecordingSession:
         session._subscribe_topic = "/av/u/test_msid_789"
         session._publish_topic = "/av/moto/test_moto_123/u/test_device_id_abc123"
 
-        mock_recorder = MagicMock()
-        mock_recorder.stop = AsyncMock()
-        session._recorder = mock_recorder
+        mock_writer = MagicMock()
+        session._writer = mock_writer
+        coord.hass.async_add_executor_job = AsyncMock(
+            side_effect=lambda fn, *args: fn(*args)
+        )
 
         mock_pc = MagicMock()
         mock_pc.close = AsyncMock()
@@ -117,12 +119,29 @@ class TestRecordingSession:
         await session.async_stop()
 
         assert session._stopped is True
-        mock_recorder.stop.assert_awaited_once()
+        mock_writer.close.assert_called_once()
+        assert session._writer is None
         mock_pc.close.assert_awaited_once()
         # MQTT callback should have been removed via public method
         coord.mqtt_client.message_callback_remove.assert_called_with(
             "/av/u/test_msid_789", session._signaling_cb
         )
+
+    def test_recording_session_refuses_to_decode(
+        self, mock_recording_coordinator
+    ) -> None:
+        """Without the encoded-frame tap the session must fail, never decode."""
+        from custom_components.tuya_peephole.recorder import RecordingSession
+
+        session = RecordingSession(
+            mock_recording_coordinator, "/tmp/test_recording.mp4.tmp"
+        )
+        session._writer = MagicMock()
+        with patch(
+            "custom_components.tuya_peephole.recorder.install_encoded_frame_tap",
+            return_value=False,
+        ), pytest.raises(RuntimeError):
+            session._setup_video_receiver(MagicMock())
 
     @pytest.mark.asyncio
     async def test_recording_session_stop_idempotent(

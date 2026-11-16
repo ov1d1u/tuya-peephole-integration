@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import re
 import time
 from collections.abc import Callable
@@ -130,20 +131,18 @@ def patch_aiortc_h264_depayloader(h264_module: Any = None) -> bool:
 def split_annexb(data: bytes) -> list[bytes]:
     """Split an Annex-B byte stream into NAL units (without start codes)."""
     nals: list[bytes] = []
-    i, n = 0, len(data)
-    start = -1
-    while i + 3 <= n:
-        if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
-            if start >= 0:
-                end = i - 1 if i > 0 and data[i - 1] == 0 else i
-                if end > start:
-                    nals.append(data[start:end])
-            i += 3
-            start = i
-        else:
-            i += 1
-    if 0 <= start < n:
-        nals.append(data[start:])
+    pos = data.find(b"\x00\x00\x01")  # C-speed scan; runs for every frame
+    while pos >= 0:
+        start = pos + 3
+        pos = data.find(b"\x00\x00\x01", start)
+        if pos < 0:
+            if start < len(data):
+                nals.append(data[start:])
+            break
+        # A zero before the start code belongs to it (4-byte form)
+        end = pos - 1 if data[pos - 1] == 0 else pos
+        if end > start:
+            nals.append(data[start:end])
     return nals
 
 
@@ -321,6 +320,45 @@ def install_hole_skipping_jitter_buffer(receiver: Any) -> bool:
     return True
 
 
+class _EncodedFrameTap(queue.Queue):
+    """Stand-in for an RTCRtpReceiver's decoder queue that skips decoding.
+
+    aiortc puts (codec, encoded_frame) on this queue for its decoder thread.
+    The tap hands each encoded frame to a sink instead, so nothing is ever
+    decoded and the track's (unbounded) frame queue stays empty. Only the
+    None stop marker reaches the queue itself, which lets aiortc's decoder
+    thread exit normally when the receiver stops.
+    """
+
+    def __init__(self, sink: Callable[[bytes, int], None]) -> None:
+        super().__init__()
+        self._sink = sink
+
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+        if item is None:
+            super().put(None, block, timeout)
+            return
+        _codec, encoded_frame = item
+        self._sink(encoded_frame.data, encoded_frame.timestamp)
+
+
+def install_encoded_frame_tap(
+    receiver: Any, sink: Callable[[bytes, int], None]
+) -> bool:
+    """Route a fresh RTCRtpReceiver's encoded frames to sink, undecoded.
+
+    sink(data, timestamp) is called on the event loop with each reassembled
+    frame (Annex-B bytes, 90 kHz timestamp starting at 0). Must run before
+    the receiver starts, since its decoder thread binds the queue then.
+    """
+    attr = "_RTCRtpReceiver__decoder_queue"
+    if getattr(receiver, attr, None) is None:
+        _LOGGER.debug("Cannot install encoded frame tap")
+        return False
+    setattr(receiver, attr, _EncodedFrameTap(sink))
+    return True
+
+
 if AIORTC_AVAILABLE:
     patch_aiortc_h264_depayloader()
     patch_aiortc_h264_decoder()
@@ -418,6 +456,9 @@ class ServerWebRTCSession:
     def _setup_media(self) -> None:
         """Prepare media sinks after the PeerConnection is created."""
 
+    def _setup_video_receiver(self, receiver: Any) -> None:
+        """Adjust the video receiver before it starts (raise to abort)."""
+
     async def _async_on_video_track(self, track: Any) -> None:
         """Handle the camera's video track."""
 
@@ -480,6 +521,7 @@ class ServerWebRTCSession:
                 "video", direction="recvonly"
             )
             install_hole_skipping_jitter_buffer(transceiver.receiver)
+            self._setup_video_receiver(transceiver.receiver)
 
             # Step 6: Register track handler
             @self._pc.on("track")

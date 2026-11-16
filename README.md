@@ -10,7 +10,7 @@ Custom Home Assistant integration for battery-powered Wi-Fi peephole cameras bas
 - **Motion Detection** — Real-time motion alerts via MQTT push (no polling)
 - **Snapshot** — On-demand image grabbed from the live WebRTC stream; shown by a separate `image` entity, while the camera entity is live video only (no automatic captures, to save battery)
 - **Battery & Signal Sensors** — Monitor charge level and Wi-Fi strength
-- **Motion Recording** — Automatic 60-second MP4 recording on motion events
+- **Motion Recording** — Automatic 60-second MP4 recording on motion events (the camera's H.265 stream is saved as is, without re-encoding; playback needs a browser with HEVC support)
 - **Recording Browser** — Browse and play recordings via HA media browser
 - **24/7 Stream** — Continuous streaming when camera is on charger
 - **Event History** — View past events from Tuya Message Center

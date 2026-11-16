@@ -1,18 +1,29 @@
 """Server-side WebRTC recording via aiortc.
 
 Creates an independent RTCPeerConnection to the camera (separate from
-the SDP proxy camera entity), receives H.264 video, and muxes to MP4
-via aiortc's MediaRecorder. Uses existing MQTT protocol 302 signaling
-(see webrtc_session.ServerWebRTCSession).
+the SDP proxy camera entity) and writes the received video to MP4 using
+the existing MQTT protocol 302 signaling (see
+webrtc_session.ServerWebRTCSession).
+
+The encoded stream is remuxed as is: frames are taken from aiortc before
+its decoder and handed to a writer thread that muxes them into the MP4.
+Nothing is decoded or re-encoded. Decoding 1080p video and re-encoding it
+with libx264 (aiortc's MediaRecorder) cost ~3 MB per frame, and frames
+piled up in aiortc's unbounded track queue whenever the encoder fell
+behind, growing Home Assistant by 1-2 GB per one-minute recording.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import queue
 import shutil
+import threading
 from collections.abc import Callable
 from datetime import timedelta
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,22 +41,179 @@ from .const import (
     RETENTION_DAYS,
 )
 from .models import CameraState
-from .webrtc_session import AIORTC_AVAILABLE, ServerWebRTCSession
+from .webrtc_session import (
+    AIORTC_AVAILABLE,
+    ServerWebRTCSession,
+    install_encoded_frame_tap,
+    split_annexb,
+    split_hevc_access_units,
+)
 
 if TYPE_CHECKING:
     from .coordinator import TuyaPeepholeCoordinator
 
-if AIORTC_AVAILABLE:
-    from aiortc.contrib.media import MediaRecorder
-
 _LOGGER = logging.getLogger(__name__)
+
+# Encoded frames waiting for the writer thread. The camera sends ~6-15
+# frames/s of a few KB each, so this is seconds of slack, a few MB at most.
+# Frames beyond it are dropped instead of growing memory.
+WRITER_QUEUE_MAX_FRAMES = 300
+
+_VIDEO_TIME_BASE = Fraction(1, 90000)  # RTP video clock
+_HEVC_VPS_MARKER = b"\x00\x00\x00\x01\x40\x01"
+_HEVC_IRAP_TYPES = range(16, 22)  # BLA, IDR, CRA
+_H264_IDR_TYPE = 5
+
+
+def _is_keyframe(unit: bytes, codec: str) -> bool:
+    """Return True if an Annex-B access unit holds a random access picture."""
+    for nal in split_annexb(unit):
+        if not nal:
+            continue
+        if codec == "hevc":
+            if ((nal[0] >> 1) & 0x3F) in _HEVC_IRAP_TYPES:
+                return True
+        elif nal[0] & 0x1F == _H264_IDR_TYPE:
+            return True
+    return False
+
+
+class EncodedVideoMp4Writer:
+    """Mux the camera's encoded video (HEVC or H.264) into an MP4 file.
+
+    put() is cheap and non-blocking (event loop); a dedicated thread owns
+    the PyAV container and does all file I/O. Writing starts at the first
+    keyframe, whose parameter sets describe the stream for the MP4 header.
+    close() blocks until the file is finalized; run it in an executor.
+    """
+
+    def __init__(self, output_path: str) -> None:
+        """Initialize the writer (the thread starts on start())."""
+        self._output_path = output_path
+        self._queue: queue.Queue[tuple[bytes, int] | None] = queue.Queue(
+            maxsize=WRITER_QUEUE_MAX_FRAMES
+        )
+        self._thread = threading.Thread(
+            target=self._run, name="tuya_peephole_recorder", daemon=True
+        )
+        self._closed = False
+        self._dropped = 0
+        self.frames_written = 0
+
+    def start(self) -> None:
+        """Start the writer thread."""
+        self._thread.start()
+
+    def put(self, data: bytes, timestamp: int) -> None:
+        """Queue one encoded frame (Annex-B, 90 kHz timestamp)."""
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait((data, timestamp))
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped == 1:
+                _LOGGER.warning(
+                    "Recording writer is falling behind; dropping frames"
+                )
+
+    def close(self) -> None:
+        """Flush queued frames, finalize the MP4 and stop the thread."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread.is_alive():
+            self._queue.put(None)  # blocks only while the queue is full
+            self._thread.join()
+        if self._dropped:
+            _LOGGER.warning(
+                "Recording dropped %d frames (writer too slow)", self._dropped
+            )
+
+    def _run(self) -> None:
+        """Writer thread: mux frames until the stop marker arrives."""
+        import av  # pylint: disable=import-outside-toplevel
+
+        container: Any = None
+        stream: Any = None
+        codec: str | None = None
+        last_pts = -1
+        try:
+            while (item := self._queue.get()) is not None:
+                data, timestamp = item
+                if codec is None:
+                    # Decide at a keyframe; frames before one are useless.
+                    # (An HEVC NAL header byte is even, so it never reads
+                    # as an H.264 IDR, type 5.)
+                    if _HEVC_VPS_MARKER in data:
+                        codec = "hevc"
+                    elif _is_keyframe(data, "h264"):
+                        codec = "h264"
+                    else:
+                        continue
+                units = (
+                    split_hevc_access_units(data) if codec == "hevc" else [data]
+                )
+                for unit in units:
+                    keyframe = _is_keyframe(unit, codec)
+                    if container is None:
+                        if not keyframe:
+                            continue  # nothing is decodable before one
+                        container, stream = self._open(av, codec, unit)
+                    # The camera's first burst carries several pictures
+                    # under one RTP timestamp; MP4 needs increasing ones.
+                    pts = max(timestamp, last_pts + 1)
+                    last_pts = pts
+                    packet = av.Packet(unit)
+                    packet.pts = packet.dts = pts
+                    packet.time_base = _VIDEO_TIME_BASE
+                    packet.is_keyframe = keyframe
+                    packet.stream = stream
+                    container.mux(packet)
+                    self.frames_written += 1
+        except Exception:
+            _LOGGER.exception("Recording writer failed")
+            # Keep draining so put()/close() never block on a full queue
+            while self._queue.get() is not None:
+                pass
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    _LOGGER.exception("Error finalizing recording")
+
+    def _open(self, av: Any, codec: str, keyframe_unit: bytes) -> tuple[Any, Any]:
+        """Create the MP4 with a stream described by the first keyframe."""
+        # Probing the keyframe as a raw elementary stream yields the codec
+        # parameters (size, profile, parameter sets) the MP4 header needs.
+        with av.open(io.BytesIO(keyframe_unit), format=codec) as probe:
+            template = probe.streams.video[0]
+            container = av.open(
+                self._output_path,
+                mode="w",
+                format="mp4",
+                options={"movflags": "+faststart"},
+            )
+            stream = container.add_stream_from_template(template)
+        stream.time_base = _VIDEO_TIME_BASE
+        if codec == "hevc":
+            stream.codec_tag = "hvc1"  # the tag Safari and Chrome expect
+        _LOGGER.debug(
+            "Recording %s %dx%d to %s",
+            codec,
+            stream.width,
+            stream.height,
+            self._output_path,
+        )
+        return container, stream
 
 
 class RecordingSession(ServerWebRTCSession):
-    """Server-side aiortc WebRTC session for recording camera video to MP4.
+    """Server-side aiortc WebRTC session recording camera video to MP4.
 
-    Negotiates the stream via ServerWebRTCSession and muxes the received
-    H.264 video to an MP4 file via aiortc's MediaRecorder.
+    Negotiates the stream via ServerWebRTCSession and remuxes the camera's
+    encoded video into MP4 via EncodedVideoMp4Writer, without decoding.
     """
 
     _label = "Recording"
@@ -61,21 +229,28 @@ class RecordingSession(ServerWebRTCSession):
         """
         super().__init__(coordinator)
         self._output_path = output_path
-        self._recorder: Any = None  # MediaRecorder
+        self._writer: EncodedVideoMp4Writer | None = None
 
     def _setup_media(self) -> None:
-        """Create the MP4 MediaRecorder."""
-        self._recorder = MediaRecorder(self._output_path, format="mp4")
+        """Start the MP4 writer thread."""
+        self._writer = EncodedVideoMp4Writer(self._output_path)
+        self._writer.start()
 
-    async def _async_on_video_track(self, track: Any) -> None:
-        """Start muxing the camera's video track to MP4."""
-        self._recorder.addTrack(track)
-        await self._recorder.start()
+    def _setup_video_receiver(self, receiver: Any) -> None:
+        """Send the receiver's encoded frames to the writer, undecoded."""
+        writer = self._writer
+        if writer is None or not install_encoded_frame_tap(receiver, writer.put):
+            # Never fall back to decoding: that is what exhausted memory.
+            raise RuntimeError("cannot tap the camera's encoded video")
 
     async def _async_close_media(self) -> None:
-        """Stop the MediaRecorder (finalizes the MP4)."""
-        if self._recorder is not None:
-            await self._recorder.stop()
+        """Finalize the MP4 (blocking file I/O, so in an executor)."""
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            await self._coordinator.hass.async_add_executor_job(writer.close)
+            _LOGGER.debug(
+                "Recording writer closed: %d frames", writer.frames_written
+            )
 
 
 class RecordingManager:
