@@ -26,7 +26,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import dt as dt_util
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
 from .const import (
@@ -52,8 +51,6 @@ if TYPE_CHECKING:
     from .coordinator import TuyaPeepholeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-
-ATTR_LAST_FRAME = "last_frame"
 
 
 async def async_setup_entry(
@@ -125,42 +122,13 @@ class TuyaPeepholeCamera(Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return the last snapshot grabbed from the live stream.
+        """Return no still image: this entity is live video only.
 
         Home Assistant calls this every few seconds while a camera card is
-        open. Opening a WebRTC stream each time would keep this battery
-        camera awake, so this only returns the stored image. A fresh one is
-        captured by the Snapshot button (coordinator.async_capture_snapshot).
+        open, and opening a stream each time would keep this battery camera
+        awake. Snapshots from the Snapshot button are on the image entity.
         """
-        return self.coordinator.last_snapshot
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose when the stored frame (snapshot) was captured."""
-        captured = self.coordinator.last_snapshot_time
-        return {
-            ATTR_LAST_FRAME: (
-                dt_util.utc_from_timestamp(captured).isoformat()
-                if captured is not None
-                else None
-            )
-        }
-
-    async def async_added_to_hass(self) -> None:
-        """Refresh entity state (and the image URL) when a snapshot lands."""
-        await super().async_added_to_hass()
-        last_seen = self.coordinator.last_snapshot_time
-
-        @callback
-        def _on_coordinator_update() -> None:
-            nonlocal last_seen
-            if self.coordinator.last_snapshot_time != last_seen:
-                last_seen = self.coordinator.last_snapshot_time
-                self.async_write_ha_state()
-
-        self.async_on_remove(
-            self.coordinator.async_add_listener(_on_coordinator_update)
-        )
+        return None
 
     async def _async_ensure_config(self) -> None:
         """Fetch and cache WebRTC and MQTT config from Tuya API."""

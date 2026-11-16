@@ -178,45 +178,24 @@ class TestCameraAvailability:
 
 
 class TestCameraSnapshot:
-    """Tests for async_camera_image (serves the stored snapshot)."""
+    """The camera entity is video-only: no still image."""
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_returns_none_without_snapshot(self) -> None:
-        """No snapshot captured yet -> None, and nothing is woken or fetched."""
-        coordinator = _make_mock_coordinator()
-        coordinator.last_snapshot = None
-        camera = _make_camera(coordinator)
-        result = await camera.async_camera_image()
-        assert result is None
-        coordinator.async_wake_camera.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_async_camera_image_returns_stored_snapshot(self) -> None:
-        """Returns the coordinator's last snapshot without opening a stream."""
+    async def test_async_camera_image_returns_none(self) -> None:
+        """Returns None even with a stored snapshot, and wakes nothing."""
         coordinator = _make_mock_coordinator()
         coordinator.last_snapshot = b"\xff\xd8jpeg"
         coordinator.async_capture_snapshot = AsyncMock()
         camera = _make_camera(coordinator)
         result = await camera.async_camera_image(width=640, height=480)
-        assert result == b"\xff\xd8jpeg"
+        assert result is None
         coordinator.async_capture_snapshot.assert_not_awaited()
         coordinator.async_wake_camera.assert_not_awaited()
 
-    def test_last_frame_attribute_none_without_snapshot(self) -> None:
-        """No snapshot yet -> last_frame attribute is None."""
-        coordinator = _make_mock_coordinator()
-        coordinator.last_snapshot_time = None
-        camera = _make_camera(coordinator)
-        assert camera.extra_state_attributes == {"last_frame": None}
-
-    def test_last_frame_attribute_is_iso_timestamp(self) -> None:
-        """last_frame is the snapshot's capture time as a UTC ISO string."""
-        coordinator = _make_mock_coordinator()
-        coordinator.last_snapshot_time = 1_700_000_000.0
-        camera = _make_camera(coordinator)
-        assert camera.extra_state_attributes == {
-            "last_frame": "2023-11-14T22:13:20+00:00"
-        }
+    def test_no_last_frame_attribute(self) -> None:
+        """Snapshot timing moved to the image entity."""
+        camera = _make_camera()
+        assert "extra_state_attributes" not in type(camera).__dict__
 
 
 # ---------------------------------------------------------------------------

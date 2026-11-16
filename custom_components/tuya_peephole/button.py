@@ -83,7 +83,7 @@ class TuyaSnapshotButton(TuyaPeepholeEntity, ButtonEntity):
     """Snapshot button entity.
 
     Wakes the camera, grabs one frame from its live WebRTC stream, and
-    stores it as the camera entity's image.
+    stores it for the snapshot image entity.
     """
 
     _attr_icon = "mdi:camera"

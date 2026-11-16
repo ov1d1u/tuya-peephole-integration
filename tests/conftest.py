@@ -62,6 +62,7 @@ class _MockPlatform:
     BUTTON = "button"
     CAMERA = "camera"
     EVENT = "event"
+    IMAGE = "image"
     SENSOR = "sensor"
 
 
@@ -198,6 +199,21 @@ class _MockButtonEntity:
 
 
 _ha_button.ButtonEntity = _MockButtonEntity  # type: ignore[attr-defined]
+
+# homeassistant.components.image
+_ha_image = types.ModuleType("homeassistant.components.image")
+
+
+class _MockImageEntity:
+    """Mock ImageEntity (the real one needs hass for access tokens)."""
+
+    _attr_content_type = "image/jpeg"
+
+    def __init__(self, hass, verify_ssl=False):
+        self.hass = hass
+
+
+_ha_image.ImageEntity = _MockImageEntity  # type: ignore[attr-defined]
 
 # homeassistant.components.sensor
 _ha_sensor = types.ModuleType("homeassistant.components.sensor")
@@ -618,6 +634,7 @@ sys.modules["homeassistant.components"] = _ha_components
 sys.modules["homeassistant.components.binary_sensor"] = _ha_binary_sensor
 sys.modules["homeassistant.components.button"] = _ha_button
 sys.modules["homeassistant.components.event"] = _ha_event
+sys.modules["homeassistant.components.image"] = _ha_image
 sys.modules["homeassistant.components.sensor"] = _ha_sensor
 sys.modules["homeassistant.config_entries"] = _ha_config_entries
 sys.modules["homeassistant.data_entry_flow"] = _ha_data_entry_flow
