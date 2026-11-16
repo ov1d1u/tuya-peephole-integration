@@ -202,6 +202,22 @@ class TestCameraSnapshot:
         coordinator.async_capture_snapshot.assert_not_awaited()
         coordinator.async_wake_camera.assert_not_awaited()
 
+    def test_last_frame_attribute_none_without_snapshot(self) -> None:
+        """No snapshot yet -> last_frame attribute is None."""
+        coordinator = _make_mock_coordinator()
+        coordinator.last_snapshot_time = None
+        camera = _make_camera(coordinator)
+        assert camera.extra_state_attributes == {"last_frame": None}
+
+    def test_last_frame_attribute_is_iso_timestamp(self) -> None:
+        """last_frame is the snapshot's capture time as a UTC ISO string."""
+        coordinator = _make_mock_coordinator()
+        coordinator.last_snapshot_time = 1_700_000_000.0
+        camera = _make_camera(coordinator)
+        assert camera.extra_state_attributes == {
+            "last_frame": "2023-11-14T22:13:20+00:00"
+        }
+
 
 # ---------------------------------------------------------------------------
 # WebRTC client configuration tests

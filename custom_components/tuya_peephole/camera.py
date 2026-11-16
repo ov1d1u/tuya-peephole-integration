@@ -26,6 +26,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
 from .const import (
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from .coordinator import TuyaPeepholeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+ATTR_LAST_FRAME = "last_frame"
 
 
 async def async_setup_entry(
@@ -130,6 +133,18 @@ class TuyaPeepholeCamera(Camera):
         captured by the Snapshot button (coordinator.async_capture_snapshot).
         """
         return self.coordinator.last_snapshot
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose when the stored frame (snapshot) was captured."""
+        captured = self.coordinator.last_snapshot_time
+        return {
+            ATTR_LAST_FRAME: (
+                dt_util.utc_from_timestamp(captured).isoformat()
+                if captured is not None
+                else None
+            )
+        }
 
     async def async_added_to_hass(self) -> None:
         """Refresh entity state (and the image URL) when a snapshot lands."""

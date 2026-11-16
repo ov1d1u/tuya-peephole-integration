@@ -452,6 +452,8 @@ _ha_util_dt = types.ModuleType("homeassistant.util.dt")
 from datetime import datetime, timezone  # noqa: E402
 
 _ha_util_dt.now = MagicMock(side_effect=lambda: datetime.now(tz=timezone.utc))  # type: ignore[attr-defined]
+_ha_util_dt.utc_from_timestamp = lambda ts: datetime.fromtimestamp(ts, tz=timezone.utc)  # type: ignore[attr-defined]
+_ha_util.dt = _ha_util_dt  # type: ignore[attr-defined]
 sys.modules["homeassistant.util"] = _ha_util
 sys.modules["homeassistant.util.dt"] = _ha_util_dt
 
