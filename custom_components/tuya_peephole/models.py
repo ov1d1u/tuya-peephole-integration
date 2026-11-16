@@ -117,10 +117,20 @@ class TuyaMQTTMessage:
         # Explicit wake confirmation
         if "wireless_awake" in self._text:
             return True
-        # DPS update = camera is active and responding
         if self._json is not None:
             proto = self._json.get("protocol")
+            # DPS update = camera is active and responding
             if proto in (4, 56):
+                return True
+            # The cloud reports the camera left its low-power link. The
+            # official app treats this as the end of a wake.
+            data = self._json.get("data")
+            if (
+                proto == 1
+                and isinstance(data, dict)
+                and data.get("lowPowerConnect") is False
+                and data.get("online") is True
+            ):
                 return True
         return False
 
@@ -130,8 +140,9 @@ class TuyaMQTTMessage:
 
         The camera reports DPS 149 = true when it wakes and false when it
         goes back to sleep, and the cloud reports it "online": false as it
-        drops to its low-power link. A camera in that state still answers
-        WebRTC signaling but never sends video.
+        drops to its low-power link (or "lowPowerConnect": true). A
+        camera in that state still answers WebRTC signaling but never
+        sends video.
         """
         if self._json is None:
             return False
@@ -142,7 +153,46 @@ class TuyaMQTTMessage:
             dps = data.get("dps")
             if isinstance(dps, dict) and dps.get(DPS_AWAKE) is False:
                 return True
+        if data.get("lowPowerConnect") is True:
+            return True
         return data.get("online") is False
+
+    @property
+    def doorbell_call(self) -> dict[str, Any] | None:
+        """Return the doorbell ring in this message, if any.
+
+        The camera reports a ring as MQTT protocol 43:
+        {"protocol":43,"data":{"devId":...,"etype":"doorbell",
+        "edata":<message id>,"timestamp":<s or ms>}}. "etype" is
+        "doorbell" for a plain ring and "ac_doorbell" for a ring that
+        opens a video call in the app.
+
+        Returns:
+            Dict with message_id, type and time (epoch seconds), or None.
+        """
+        if self._json is None or self._json.get("protocol") != 43:
+            return None
+        data = self._json.get("data")
+        if not isinstance(data, dict):
+            return None
+        call_type = data.get("etype")
+        message_id = data.get("edata")
+        if not call_type or not message_id:
+            return None
+        raw_time = data.get("dataTimestamp") or data.get("timestamp")
+        if not raw_time:
+            raw_time = self._json.get("t")
+        try:
+            ring_time = float(raw_time)
+        except (TypeError, ValueError):
+            ring_time = None
+        if ring_time is not None and ring_time > 1e11:
+            ring_time /= 1000  # milliseconds
+        return {
+            "message_id": str(message_id),
+            "type": str(call_type),
+            "time": ring_time,
+        }
 
     @property
     def is_motion(self) -> bool:

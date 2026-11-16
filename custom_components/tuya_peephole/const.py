@@ -42,6 +42,11 @@ MQTT_RECONNECT_MIN_DELAY = 5  # seconds before the first reconnect attempt
 MQTT_RECONNECT_MAX_DELAY = 300  # cap for the exponential reconnect backoff
 WAKE_TIMEOUT = 20  # seconds to wait for wireless_awake
 WAKE_COOLDOWN = 5  # seconds between wake requests
+# The official app resends the wake packet every second until the camera
+# wakes, unless the cloud supplies its own schedule (p2pConfig.wakeScheduleMs)
+WAKE_RESEND_INTERVAL = 1  # seconds
+DOORBELL_RING_TIMEOUT = 25  # seconds a ring lasts (app default); older rings are ignored
+EVENT_DOORBELL = "tuya_peephole_doorbell"  # HA event fired on each ring
 MOTION_CLEAR_TIMEOUT = 30  # seconds before motion auto-clears
 
 # WebRTC signaling settings

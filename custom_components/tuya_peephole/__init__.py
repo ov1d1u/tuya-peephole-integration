@@ -37,7 +37,13 @@ _LOGGER = logging.getLogger(__name__)
 
 TOKEN_REFRESH_INTERVAL = timedelta(hours=TOKEN_REFRESH_HOURS)
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.CAMERA, Platform.SENSOR]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CAMERA,
+    Platform.EVENT,
+    Platform.SENSOR,
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

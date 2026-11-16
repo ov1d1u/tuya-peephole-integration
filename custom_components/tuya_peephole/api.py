@@ -394,6 +394,11 @@ class TuyaSmartAPI:
         self._message_cache_time = time.time()
         return events
 
+    @property
+    def cached_webrtc_config(self) -> dict[str, Any] | None:
+        """Return the last jarvis/config result without fetching it."""
+        return self._webrtc_cache
+
     def invalidate_cache(self) -> None:
         """Clear cached WebRTC and MQTT config.
 

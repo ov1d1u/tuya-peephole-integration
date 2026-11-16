@@ -61,6 +61,7 @@ class _MockPlatform:
     BINARY_SENSOR = "binary_sensor"
     BUTTON = "button"
     CAMERA = "camera"
+    EVENT = "event"
     SENSOR = "sensor"
 
 
@@ -162,6 +163,29 @@ class _MockBinarySensorEntity:
 
 _ha_binary_sensor.BinarySensorDeviceClass = _MockBinarySensorDeviceClass  # type: ignore[attr-defined]
 _ha_binary_sensor.BinarySensorEntity = _MockBinarySensorEntity  # type: ignore[attr-defined]
+
+# homeassistant.components.event
+_ha_event = types.ModuleType("homeassistant.components.event")
+
+
+class _MockEventDeviceClass:
+    """Mock EventDeviceClass."""
+
+    DOORBELL = "doorbell"
+
+
+class _MockEventEntity:
+    """Mock EventEntity recording triggered events."""
+
+    _attr_device_class = None
+    _attr_event_types: list[str] = []
+
+    def _trigger_event(self, event_type, event_attributes=None):
+        self.last_event = (event_type, event_attributes)
+
+
+_ha_event.EventDeviceClass = _MockEventDeviceClass  # type: ignore[attr-defined]
+_ha_event.EventEntity = _MockEventEntity  # type: ignore[attr-defined]
 
 # homeassistant.components.button
 _ha_button = types.ModuleType("homeassistant.components.button")
@@ -593,6 +617,7 @@ sys.modules["homeassistant.helpers.entity_platform"] = _ha_helpers_entity_platfo
 sys.modules["homeassistant.components"] = _ha_components
 sys.modules["homeassistant.components.binary_sensor"] = _ha_binary_sensor
 sys.modules["homeassistant.components.button"] = _ha_button
+sys.modules["homeassistant.components.event"] = _ha_event
 sys.modules["homeassistant.components.sensor"] = _ha_sensor
 sys.modules["homeassistant.config_entries"] = _ha_config_entries
 sys.modules["homeassistant.data_entry_flow"] = _ha_data_entry_flow

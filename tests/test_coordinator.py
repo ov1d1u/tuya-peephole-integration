@@ -627,3 +627,203 @@ class TestSleepSignal:
 
         assert result is True
         coordinator.mqtt_client.publish.assert_called_once()
+
+
+# Messages the official Tuya app reacts to (from the decompiled 7.12.3 APK)
+_LOW_POWER_LINK = (
+    b'{"protocol":1,"t":1794742110,"data":{"devId":"test_device",'
+    b'"online":true,"lowPowerConnect":true,"lastConnectChangeTime":1}}'
+)
+_LEFT_LOW_POWER_LINK = (
+    b'{"protocol":1,"t":1794742110,"data":{"devId":"test_device",'
+    b'"online":true,"lowPowerConnect":false,"lastConnectChangeTime":2}}'
+)
+
+
+def _doorbell_payload(message_id="msg1", etype="doorbell", ts=None):
+    import json as _json
+    import time as _t
+
+    return _json.dumps({
+        "protocol": 43,
+        "t": int(_t.time()),
+        "data": {
+            "devId": "test_device",
+            "etype": etype,
+            "edata": message_id,
+            "timestamp": int(_t.time()) if ts is None else ts,
+        },
+    }).encode()
+
+
+class TestLowPowerLink:
+    """Protocol 1 lowPowerConnect reports, as handled by the app."""
+
+    def test_low_power_link_is_sleep(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        msg = TuyaMQTTMessage.parse(_TOPIC, _LOW_POWER_LINK)
+        assert msg.is_sleep_signal is True
+        assert msg.is_wireless_awake is False
+
+    def test_leaving_low_power_link_is_wake(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        msg = TuyaMQTTMessage.parse(_TOPIC, _LEFT_LOW_POWER_LINK)
+        assert msg.is_sleep_signal is False
+        assert msg.is_wireless_awake is True
+
+
+class TestWakeResend:
+    """The wake packet is resent until the camera answers."""
+
+    @pytest.mark.asyncio
+    async def test_wake_resent_every_interval(self, mock_hass_with_loop) -> None:
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator.mqtt_client = _make_mock_mqtt_client()
+
+        with (
+            patch(
+                "custom_components.tuya_peephole.coordinator.WAKE_TIMEOUT", 0.1
+            ),
+            patch(
+                "custom_components.tuya_peephole.coordinator.WAKE_RESEND_INTERVAL",
+                0.02,
+            ),
+            patch(
+                "custom_components.tuya_peephole.coordinator.async_call_later",
+                return_value=MagicMock(),
+            ),
+        ):
+            result = await coordinator.async_wake_camera()
+
+        assert result is False
+        assert 4 <= coordinator.mqtt_client.publish.call_count <= 6
+
+    @pytest.mark.asyncio
+    async def test_wake_stops_resending_once_awake(
+        self, mock_hass_with_loop
+    ) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        coordinator.mqtt_client = _make_mock_mqtt_client()
+
+        async def camera() -> None:
+            await asyncio.sleep(0.05)
+            coordinator._handle_mqtt_message(
+                TuyaMQTTMessage.parse(_TOPIC, _LEFT_LOW_POWER_LINK)
+            )
+
+        task = asyncio.create_task(camera())
+        with (
+            patch(
+                "custom_components.tuya_peephole.coordinator.WAKE_RESEND_INTERVAL",
+                0.02,
+            ),
+            patch(
+                "custom_components.tuya_peephole.coordinator.async_call_later",
+                return_value=MagicMock(),
+            ),
+        ):
+            result = await coordinator.async_wake_camera()
+        await task
+        sent = coordinator.mqtt_client.publish.call_count
+        await asyncio.sleep(0.06)
+
+        assert result is True
+        assert 2 <= sent <= 4
+        assert coordinator.mqtt_client.publish.call_count == sent
+
+    @pytest.mark.asyncio
+    async def test_wake_follows_cloud_schedule(self, mock_hass_with_loop) -> None:
+        api = MagicMock()
+        api.cached_webrtc_config = {"p2pConfig": {"wakeScheduleMs": [0, 30, 60]}}
+        coordinator = _make_coordinator(mock_hass_with_loop, mock_api=api)
+        coordinator.mqtt_client = _make_mock_mqtt_client()
+
+        with (
+            patch(
+                "custom_components.tuya_peephole.coordinator.WAKE_TIMEOUT", 0.1
+            ),
+            patch(
+                "custom_components.tuya_peephole.coordinator.async_call_later",
+                return_value=MagicMock(),
+            ),
+        ):
+            result = await coordinator.async_wake_camera()
+
+        assert result is False
+        assert coordinator.mqtt_client.publish.call_count == 3
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            (None, None),
+            ({}, None),
+            ({"wakeScheduleMs": [1000, 0, -5, "x"]}, [0.0, 1.0]),
+            ({"p2pConfig": {"wakeScheduleMs": [500]}}, [0.5]),
+            ({"p2pConfig": {"wakeScheduleMs": []}}, None),
+        ],
+    )
+    def test_parse_wake_schedule(self, config, expected) -> None:
+        from custom_components.tuya_peephole.coordinator import parse_wake_schedule
+
+        assert parse_wake_schedule(config) == expected
+
+
+class TestDoorbell:
+    """Doorbell rings arrive as MQTT protocol 43."""
+
+    def test_parse_doorbell_call(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        call = TuyaMQTTMessage.parse(
+            _TOPIC, _doorbell_payload("abc", "ac_doorbell", 1794742110123)
+        ).doorbell_call
+        assert call == {
+            "message_id": "abc",
+            "type": "ac_doorbell",
+            "time": pytest.approx(1794742110.123),
+        }
+
+    def test_other_protocols_are_not_doorbell(self) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        assert TuyaMQTTMessage.parse(_TOPIC, _WAKE_DPS).doorbell_call is None
+
+    def test_ring_notifies_once(self, mock_hass_with_loop) -> None:
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        rings = []
+        coordinator.register_doorbell_callback(rings.append)
+
+        for _ in range(2):
+            coordinator._handle_mqtt_message(
+                TuyaMQTTMessage.parse(_TOPIC, _doorbell_payload("m1"))
+            )
+
+        assert [r["message_id"] for r in rings] == ["m1"]
+        mock_hass_with_loop.bus.async_fire.assert_called_once()
+        event_type, event_data = mock_hass_with_loop.bus.async_fire.call_args.args
+        assert event_type == "tuya_peephole_doorbell"
+        assert event_data["message_id"] == "m1"
+        assert coordinator.last_doorbell["message_id"] == "m1"
+
+    def test_stale_ring_ignored(self, mock_hass_with_loop) -> None:
+        import time as _t
+
+        from custom_components.tuya_peephole.models import TuyaMQTTMessage
+
+        coordinator = _make_coordinator(mock_hass_with_loop)
+        rings = []
+        coordinator.register_doorbell_callback(rings.append)
+
+        coordinator._handle_mqtt_message(
+            TuyaMQTTMessage.parse(
+                _TOPIC, _doorbell_payload("old", ts=int(_t.time()) - 120)
+            )
+        )
+
+        assert rings == []

@@ -12,6 +12,7 @@ import logging
 import struct
 import time as _time
 import zlib
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -22,18 +23,49 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .api import TuyaSmartAPI
 from .const import (
     CHARGING_STABLE_MINUTES,
+    DOORBELL_RING_TIMEOUT,
+    EVENT_DOORBELL,
     EVENT_HISTORY_LIMIT,
     MOTION_CLEAR_TIMEOUT,
     MQTT_PORT,
     MQTT_RECONNECT_MAX_DELAY,
     MQTT_RECONNECT_MIN_DELAY,
     WAKE_COOLDOWN,
+    WAKE_RESEND_INTERVAL,
     WAKE_TIMEOUT,
 )
 from .models import CameraState, TuyaMQTTMessage
 from .mqtt import TuyaMQTTClient
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def parse_wake_schedule(config: dict[str, Any] | None) -> list[float] | None:
+    """Read the cloud's wake schedule from a jarvis/config result.
+
+    The official app resends the wake packet at each offset of
+    "wakeScheduleMs" (top level or under "p2pConfig") and gives up at the
+    last one.
+
+    Returns:
+        Offsets in seconds, ascending, or None if no usable schedule.
+    """
+    if not isinstance(config, dict):
+        return None
+    schedule = config.get("wakeScheduleMs")
+    if schedule is None and isinstance(config.get("p2pConfig"), dict):
+        schedule = config["p2pConfig"].get("wakeScheduleMs")
+    if not isinstance(schedule, list):
+        return None
+    offsets: list[float] = []
+    for item in schedule:
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            offsets.append(value / 1000)
+    return sorted(offsets) or None
 
 
 class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -91,6 +123,11 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Motion callback registration for recording manager
         self._on_motion_callbacks: list[Callable[[], None]] = []
+
+        # Doorbell rings (MQTT protocol 43)
+        self._on_doorbell_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._seen_doorbell_ids: deque[str] = deque(maxlen=50)
+        self.last_doorbell: dict[str, Any] | None = None
 
         # Charging detection heuristic
         self._charging_detected = False
@@ -212,6 +249,9 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._camera_state = CameraState.AWAKE
             self._awake_event.set()
 
+        if (call := message.doorbell_call) is not None:
+            self._handle_doorbell_call(call)
+
         if message.is_motion:
             self._motion_detected = True
             self._schedule_motion_clear()
@@ -295,27 +335,58 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._awake_event.clear()
         self._sleep_event.clear()
-        self._publish_wake()
 
-        # Wait for the camera to report awake. If it reports going to sleep
-        # instead (the wake landed while it was shutting down), wake it again.
+        # Like the official app, keep sending the wake packet until the
+        # camera reports awake: at the cloud's wakeScheduleMs offsets if it
+        # gave any, otherwise every WAKE_RESEND_INTERVAL seconds. A camera
+        # that reports going to sleep (the wake landed while it was
+        # shutting down) is woken again straight away.
+        schedule = parse_wake_schedule(self.api.cached_webrtc_config)
+        if schedule is not None:
+            _LOGGER.debug("Using cloud wake schedule %s s", schedule)
+            timeout = max(schedule[-1], WAKE_TIMEOUT)
+        else:
+            timeout = WAKE_TIMEOUT
+
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + WAKE_TIMEOUT
+        start = loop.time()
+        deadline = start + timeout
+        sent = 0
         result = False
-        while (remaining := deadline - loop.time()) > 0:
+        while True:
+            now = loop.time()
+            if schedule is None or sent < len(schedule):
+                due = (
+                    start + sent * WAKE_RESEND_INTERVAL
+                    if schedule is None
+                    else start + schedule[sent]
+                )
+                if now >= due:
+                    self._publish_wake()
+                    sent += 1
+                    continue
+                next_wake: float | None = due
+            else:
+                next_wake = None
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+            wait_for = remaining if next_wake is None else min(
+                remaining, next_wake - now
+            )
             awake_wait = asyncio.ensure_future(self._awake_event.wait())
             sleep_wait = asyncio.ensure_future(self._sleep_event.wait())
             try:
                 await asyncio.wait(
                     {awake_wait, sleep_wait},
-                    timeout=remaining,
+                    timeout=wait_for,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
                 awake_wait.cancel()
                 sleep_wait.cancel()
             if self._awake_event.is_set():
-                _LOGGER.debug("Camera confirmed awake")
+                _LOGGER.debug("Camera confirmed awake after %d wake packet(s)", sent)
                 result = True
                 break
             if self._sleep_event.is_set():
@@ -494,6 +565,51 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._on_motion_callbacks.remove(callback)
 
         return _unsub
+
+    def register_doorbell_callback(
+        self, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a callback called with each new doorbell ring.
+
+        Returns an unsubscribe function.
+        """
+        self._on_doorbell_callbacks.append(callback)
+
+        def _unsub() -> None:
+            self._on_doorbell_callbacks.remove(callback)
+
+        return _unsub
+
+    def _handle_doorbell_call(self, call: dict[str, Any]) -> None:
+        """Handle a doorbell ring (MQTT protocol 43).
+
+        Mirrors the official app: a ring is reported once per message id,
+        and rings older than DOORBELL_RING_TIMEOUT are dropped (they are
+        replays delivered after a reconnect).
+        """
+        message_id = call["message_id"]
+        if message_id in self._seen_doorbell_ids:
+            return
+        self._seen_doorbell_ids.append(message_id)
+
+        ring_time = call.get("time")
+        if ring_time is not None and _time.time() - ring_time > DOORBELL_RING_TIMEOUT:
+            _LOGGER.debug("Ignoring stale doorbell ring %s", message_id)
+            return
+
+        _LOGGER.info("Doorbell ring (%s, message %s)", call["type"], message_id)
+        self.last_doorbell = call
+        self.hass.bus.async_fire(
+            EVENT_DOORBELL,
+            {
+                "device_id": self.device_id,
+                "message_id": message_id,
+                "type": call["type"],
+                "time": ring_time,
+            },
+        )
+        for cb in list(self._on_doorbell_callbacks):
+            cb(call)
 
     def _update_charging_state(self) -> None:
         """Update charging state based on battery percentage heuristic.

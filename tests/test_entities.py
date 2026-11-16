@@ -339,3 +339,33 @@ class TestEntitySetupEntry:
         names = {type(e).__name__ for e in entities}
         assert "TuyaWakeButton" in names
         assert "TuyaSnapshotButton" in names
+
+
+class TestTuyaDoorbellEvent:
+    """Test the doorbell event entity."""
+
+    def test_doorbell_event_identity(self, mock_coordinator) -> None:
+        from custom_components.tuya_peephole.event import TuyaDoorbellEvent
+
+        entity = TuyaDoorbellEvent(mock_coordinator)
+
+        assert entity._attr_unique_id == "test_device_id_abc123_doorbell"
+        assert entity._attr_device_class == "doorbell"
+        assert entity._attr_event_types == ["ring"]
+
+    def test_ring_triggers_event(self, mock_coordinator) -> None:
+        from unittest.mock import MagicMock
+
+        from custom_components.tuya_peephole.event import TuyaDoorbellEvent
+
+        entity = TuyaDoorbellEvent(mock_coordinator)
+        entity.async_write_ha_state = MagicMock()
+
+        entity._handle_ring(
+            {"message_id": "m1", "type": "doorbell", "time": 1.0}
+        )
+
+        assert entity.last_event == (
+            "ring", {"message_id": "m1", "call_type": "doorbell"}
+        )
+        entity.async_write_ha_state.assert_called_once()

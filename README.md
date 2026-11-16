@@ -5,7 +5,8 @@ Custom Home Assistant integration for battery-powered Wi-Fi peephole cameras bas
 ## Features
 
 - **Live Video Stream** — WebRTC video directly in HA dashboard via Tuya MQTT signaling
-- **Camera Wake** — Wake sleeping battery camera on demand
+- **Camera Wake** — Wake sleeping battery camera on demand, resending the wake packet every second (or on the cloud's wake schedule) until it answers, as the official app does
+- **Doorbell** — Doorbell presses (MQTT protocol 43) as an `event` entity and a `tuya_peephole_doorbell` HA event
 - **Motion Detection** — Real-time motion alerts via MQTT push (no polling)
 - **Snapshot** — On-demand image grabbed from the live WebRTC stream; the camera entity shows the last one (no automatic captures, to save battery)
 - **Battery & Signal Sensors** — Monitor charge level and Wi-Fi strength
@@ -55,6 +56,7 @@ Copy `custom_components/tuya_peephole/` to your HA `config/custom_components/` d
 | `binary_sensor.tuya_peephole_camera_awake` | Binary Sensor | On while the camera is awake, off while sleeping (`camera_state` attribute shows sleeping/waking/awake) |
 | `sensor.tuya_peephole_battery` | Sensor | Battery percentage |
 | `sensor.tuya_peephole_signal_strength` | Sensor | Wi-Fi RSSI (disabled by default) |
+| `event.tuya_peephole_doorbell` | Event | Fires `ring` on each doorbell press (attributes: `message_id`, `call_type`) |
 | `button.tuya_peephole_wake` | Button | Manual camera wake |
 | `button.tuya_peephole_snapshot` | Button | Wake the camera and grab one frame from the stream as the camera image |
 
