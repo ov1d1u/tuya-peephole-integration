@@ -284,6 +284,66 @@ class TestCoordinatorSnapshot:
         assert results == [b"jpeg", b"jpeg"]
         assert capture.await_count == 1
 
+    @pytest.mark.asyncio
+    async def test_waiter_gets_none_when_shared_capture_fails(
+        self, mock_hass_with_loop
+    ) -> None:
+        """A press waiting on a failed capture gets None, not the stale stored image."""
+        coordinator = self._make_coordinator(mock_hass_with_loop)
+        coordinator.last_snapshot = b"old"
+        release = asyncio.Event()
+
+        async def failing_capture(_coord):
+            await release.wait()
+            return None
+
+        capture = AsyncMock(side_effect=failing_capture)
+        with patch(
+            "custom_components.tuya_peephole.snapshot.async_capture_snapshot",
+            capture,
+        ):
+            first = asyncio.ensure_future(coordinator.async_capture_snapshot())
+            await asyncio.sleep(0)
+            second = asyncio.ensure_future(coordinator.async_capture_snapshot())
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        assert results == [None, None]
+        assert capture.await_count == 1
+        assert coordinator.last_snapshot == b"old"
+
+    @pytest.mark.asyncio
+    async def test_waiter_gets_none_when_shared_capture_raises(
+        self, mock_hass_with_loop
+    ) -> None:
+        """An exception in the capture releases waiters with None and allows a retry."""
+        coordinator = self._make_coordinator(mock_hass_with_loop)
+        release = asyncio.Event()
+
+        async def raising_capture(_coord):
+            await release.wait()
+            raise RuntimeError("boom")
+
+        with patch(
+            "custom_components.tuya_peephole.snapshot.async_capture_snapshot",
+            AsyncMock(side_effect=raising_capture),
+        ):
+            first = asyncio.ensure_future(coordinator.async_capture_snapshot())
+            await asyncio.sleep(0)
+            second = asyncio.ensure_future(coordinator.async_capture_snapshot())
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(RuntimeError):
+                await first
+            assert await second is None
+
+        with patch(
+            "custom_components.tuya_peephole.snapshot.async_capture_snapshot",
+            AsyncMock(return_value=b"jpeg"),
+        ):
+            assert await coordinator.async_capture_snapshot() == b"jpeg"
+
 
 # ---------------------------------------------------------------------------
 # Shared signaling topic in TuyaMQTTClient

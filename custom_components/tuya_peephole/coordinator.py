@@ -113,7 +113,9 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._shutting_down = False
 
         # Last snapshot (JPEG) grabbed from the WebRTC stream
-        self._snapshot_lock = asyncio.Lock()
+        # Result of the capture in progress, shared with callers that arrive
+        # while it runs
+        self._snapshot_future: asyncio.Future[bytes | None] | None = None
         self.last_snapshot: bytes | None = None
         self.last_snapshot_time: float | None = None  # wall-clock epoch seconds
 
@@ -380,25 +382,35 @@ class TuyaPeepholeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Grab a fresh JPEG from the camera's live stream and keep it.
 
         If a capture is already running, waits for it and returns its
-        result instead of opening a second stream.
+        result instead of opening a second stream. A failed capture returns
+        None to every caller, never the previously stored image.
 
         Returns:
             The JPEG bytes, or None if the capture failed.
         """
-        if self._snapshot_lock.locked():
-            async with self._snapshot_lock:
-                return self.last_snapshot
+        if self._snapshot_future is not None:
+            # shield: a cancelled waiter must not cancel the shared result
+            return await asyncio.shield(self._snapshot_future)
 
-        async with self._snapshot_lock:
+        future: asyncio.Future[bytes | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._snapshot_future = future
+        image: bytes | None = None
+        try:
             from .snapshot import async_capture_snapshot
 
             image = await async_capture_snapshot(self)
-            if image is None:
-                return None
-            self.last_snapshot = image
-            self.last_snapshot_time = _time.time()
-            self.async_set_updated_data(self._build_state_dict())
+            if image is not None:
+                self.last_snapshot = image
+                self.last_snapshot_time = _time.time()
+                self.async_set_updated_data(self._build_state_dict())
             return image
+        finally:
+            # Also runs on errors and cancellation, so waiters get None
+            # instead of hanging
+            self._snapshot_future = None
+            future.set_result(image)
 
     @callback
     def _reset_cooldown(self, _now: Any) -> None:
